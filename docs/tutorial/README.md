@@ -50,11 +50,13 @@ traffic with `./stack.sh traffic off` and `./stack.sh traffic on`.
 | 9 | [Explain-it-back cheat sheet and glossary](09-cheat-sheet.md) | 10 min | The whole system in five minutes, from memory |
 | 10 | [The data model, the DDL, and copying between ClickHouse servers](10-data-model.md) | 35 min | Every column and table in `schema.sql`; adding a replica; copying with `remote()` |
 | 11 | [Moving older data to S3](11-s3-tiering.md) | 30 min | Disks, storage policies and TTL moves; local S3 with SeaweedFS; real S3 settings |
+| 12 | [Operational readiness, gateway to ClickHouse](12-operations.md) | 40 min | What to monitor per component, how each fails, and a production checklist |
 
 Suggested breaks: after module 3 (10 min) and after module 6 (10 min).
 
-Modules 0 to 9 take about 5 hours. Modules 10 and 11 add about an hour; they
-fit best right after module 6, or as a follow-up session.
+Modules 0 to 9 take about 5 hours. Modules 10 to 12 add about 1 hour 45
+minutes, as a follow-up session: 10 and 11 fit best after module 6, and 12
+after all of them.
 
 If you only have two hours, do modules 0, 1, 2, 4 and 6, and read the
 cheat sheet.
@@ -70,6 +72,7 @@ cheat sheet.
 | [`labs/add-replica.sh`](labs/add-replica.sh) | Module 10: registers the third replica, which then copies everything |
 | [`labs/storage-s3.xml`](labs/storage-s3.xml), [`labs/compose.s3-tiering.yaml`](labs/compose.s3-tiering.yaml) | Module 11: S3 disk, `tiered` storage policy, and a local S3 server |
 | [`labs/enable-s3-tiering.sh`](labs/enable-s3-tiering.sh) | Module 11: puts the `otel` tables on the policy, with move and delete TTLs |
+| [`labs/health-check.sh`](labs/health-check.sh) | Module 12: one-screen health check (also `./stack.sh health`) |
 | [`labs/hello_span.py`](labs/hello_span.py), [`labs/print_callbacks.py`](labs/print_callbacks.py) | Modules 1 and 2: spans and raw LangChain callbacks |
 
 The labs only add things (a `lab` database, an extra index you drop again,

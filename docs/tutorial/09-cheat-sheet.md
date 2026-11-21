@@ -60,6 +60,9 @@ check yourself against the text. If you stumble, go back to that module's
 | Adding a replica | Same table and UUID, new `{replica}` macro: it fetches every part via Keeper | [10](10-data-model.md) |
 | Storage policy | Ordered volumes a table may use; here `default` (local) then `cold` (S3) | [11](11-s3-tiering.md) |
 | TTL move | `TTL ... TO VOLUME 'cold'`: a part moves once its newest row passes the threshold | [11](11-s3-tiering.md) |
+| Freshness | Age of the newest stored span: the first sign ingestion has stalled | [12](12-operations.md) |
+| `send_failed_spans` | Gateway counter of spans lost after every retry; alert on any increase | [12](12-operations.md) |
+| Parts per partition | Inserts are delayed at 1000 and rejected at 3000; alert well before | [12](12-operations.md) |
 
 ## Memory hooks
 

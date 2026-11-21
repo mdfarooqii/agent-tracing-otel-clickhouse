@@ -108,6 +108,7 @@ services:
       - "14317:4317"   # OTLP gRPC
       - "14318:4318"   # OTLP HTTP
       - "13133:13133"  # health check
+      - "18888:8888"   # the gateway's own metrics, Prometheus format
     depends_on:
       clickhouse-init:
         condition: service_completed_successfully

@@ -50,6 +50,17 @@ extensions:
     endpoint: 0.0.0.0:13133
 
 service:
+  # The gateway's own metrics (queue size, sent and failed spans, refused data)
+  # in Prometheus format on port 8888; the host maps it to 18888.
+  telemetry:
+    metrics:
+      level: detailed
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: 0.0.0.0
+                port: 8888
   extensions: [health_check]
   pipelines:
     traces:

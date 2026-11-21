@@ -117,6 +117,7 @@ Stop everything with:
 | `./stack.sh status` | Show containers, the traffic loop, and spans per service |
 | `./stack.sh logs` | Follow the traffic loop's output |
 | `./stack.sh traffic off` / `on` | Pause or resume the traffic loop; containers keep running |
+| `./stack.sh health` | One-screen health check of the gateway, Keeper and both ClickHouse nodes |
 | `./stack.sh down` | Stop everything; data is kept |
 | `./stack.sh down --wipe` | Stop everything and delete the ClickHouse data |
 
@@ -206,5 +207,5 @@ stack.sh              up / down / status / demo / queries / logs / traffic
 ## Troubleshooting
 
 - **No new spans.** Run `./stack.sh status` and `./stack.sh logs`. The gateway's logs are in `docker logs otel-gateway`.
-- **Port already in use.** The stack uses 8123, 8124, 9000, 9001, 13133, 14317, 14318 and 18081–18084. Stop whatever holds the port, or change the host side of the mapping in `compose.yaml`.
+- **Port already in use.** The stack uses 8123, 8124, 9000, 9001, 13133, 14317, 14318, 18888 and 18081–18084. Stop whatever holds the port, or change the host side of the mapping in `compose.yaml`.
 - **Start from scratch.** `./stack.sh down --wipe && ./stack.sh up`.
