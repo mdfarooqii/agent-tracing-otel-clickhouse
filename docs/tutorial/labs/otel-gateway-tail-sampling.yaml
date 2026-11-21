@@ -1,0 +1,22 @@
+# Lab: tail sampling at the gateway. Merged on top of otel-gateway-config.yaml
+# by compose.tail-sampling.yaml; maps merge, lists (like processors) replace.
+
+processors:
+  tail_sampling:
+    decision_wait: 10s        # hold each trace this long so all its spans arrive
+    num_traces: 20000         # traces held in memory at once
+    policies:                 # a trace is kept if ANY policy matches
+      - name: keep-errors
+        type: status_code
+        status_code: { status_codes: [ERROR] }
+      - name: keep-slow
+        type: latency
+        latency: { threshold_ms: 1500 }
+      - name: keep-10-percent-of-the-rest
+        type: probabilistic
+        probabilistic: { sampling_percentage: 10 }
+
+service:
+  pipelines:
+    traces:
+      processors: [memory_limiter, filter/require_org_labels, resource/org_platform, tail_sampling, batch]

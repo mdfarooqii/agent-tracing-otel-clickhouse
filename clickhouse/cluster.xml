@@ -19,6 +19,28 @@
                 </replica>
             </shard>
         </tracing>
+
+        <!-- Lab only (docs/tutorial/labs/sharding.sql): the same two servers
+             viewed as two shards of one replica each, to show how a sharding
+             key places spans. -->
+        <lab_2shards>
+            <shard>
+                <replica>
+                    <host>clickhouse-01</host>
+                    <port>9000</port>
+                    <user>default</user>
+                    <password>demo</password>
+                </replica>
+            </shard>
+            <shard>
+                <replica>
+                    <host>clickhouse-02</host>
+                    <port>9000</port>
+                    <user>default</user>
+                    <password>demo</password>
+                </replica>
+            </shard>
+        </lab_2shards>
     </remote_servers>
 
     <zookeeper>

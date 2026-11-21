@@ -4,6 +4,8 @@ A runnable demo of tracing a fleet of LangGraph agents with the OpenTelemetry SD
 
 [![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/mdfarooqii/agent-tracing-otel-clickhouse?quickstart=1)
 
+New to OpenTelemetry, LangGraph or ClickHouse? The [5-hour tutorial](docs/tutorial/README.md) explains every layer of this repo, with hands-on labs that break it on purpose.
+
 ## Try it in your browser
 
 1. Click **Open in GitHub Codespaces** above, then **Create codespace**.
@@ -114,6 +116,7 @@ Stop everything with:
 | `./stack.sh queries` | Run the saved queries in [`queries.sql`](queries.sql) |
 | `./stack.sh status` | Show containers, the traffic loop, and spans per service |
 | `./stack.sh logs` | Follow the traffic loop's output |
+| `./stack.sh traffic off` / `on` | Pause or resume the traffic loop; containers keep running |
 | `./stack.sh down` | Stop everything; data is kept |
 | `./stack.sh down --wipe` | Stop everything and delete the ClickHouse data |
 
@@ -192,9 +195,10 @@ agent/
   simulate.py         Starts the APIs and runs all agents, once or in a loop
 clickhouse/           Cluster, Keeper and macros config, the schema, the /play redirect
 compose.yaml          ClickHouse Keeper, two ClickHouse replicas, schema init, OTel gateway
+docs/tutorial/        The 5-hour tutorial and its lab files
 otel-gateway-config.yaml
 queries.sql           Saved queries: turns, agents, tools, errors, dependencies, span tree
-stack.sh              up / down / status / demo / queries / logs
+stack.sh              up / down / status / demo / queries / logs / traffic
 ```
 
 ## Troubleshooting

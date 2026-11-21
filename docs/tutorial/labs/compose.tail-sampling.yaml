@@ -1,0 +1,13 @@
+# Lab: restart the gateway with tail sampling turned on.
+#   docker compose -f compose.yaml -f docs/tutorial/labs/compose.tail-sampling.yaml up -d otel-gateway
+# Turn it off again with:
+#   docker compose up -d otel-gateway
+# Paths are relative to the repo root (the first compose file's folder).
+
+services:
+  otel-gateway:
+    command:
+      - --config=/etc/otel-gateway-config.yaml
+      - --config=/etc/otel-gateway-tail-sampling.yaml
+    volumes:
+      - ./docs/tutorial/labs/otel-gateway-tail-sampling.yaml:/etc/otel-gateway-tail-sampling.yaml:ro

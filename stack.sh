@@ -9,6 +9,7 @@
 #   ./stack.sh demo              one round of traffic in the foreground
 #   ./stack.sh queries           run the saved ClickHouse queries in queries.sql
 #   ./stack.sh logs              follow the traffic loop's output
+#   ./stack.sh traffic off|on    pause or resume the traffic loop; containers keep running
 #
 # TRAFFIC_INTERVAL (seconds, default 30) and TRAFFIC_TURNS (default 3) tune the loop.
 set -euo pipefail
@@ -174,5 +175,12 @@ case "${1:-}" in
   demo) demo ;;
   queries) queries ;;
   logs) tail -f "$LOG_FILE" ;;
-  *) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+  traffic)
+    case "${2:-}" in
+      on) ensure_venv; start_traffic ;;
+      off) stop_traffic ;;
+      *) echo "Usage: ./stack.sh traffic on|off" >&2; exit 1 ;;
+    esac
+    ;;
+  *) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac

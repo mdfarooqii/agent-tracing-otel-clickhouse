@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import re
 import signal
@@ -151,7 +152,11 @@ def make_handler(service: Service) -> type[BaseHTTPRequestHandler]:
                     route, params = candidate, match.groupdict()
                     break
 
-            parent = propagate.extract({key.lower(): value for key, value in self.headers.items()})
+            if os.environ.get("STRIP_TRACE_HEADERS") == "1":
+                # Simulates a proxy between environments that drops traceparent and baggage.
+                parent = propagate.extract({})
+            else:
+                parent = propagate.extract({key.lower(): value for key, value in self.headers.items()})
             attributes: dict[str, Any] = {
                 "http.request.method": self.command,
                 "url.path": url.path,
