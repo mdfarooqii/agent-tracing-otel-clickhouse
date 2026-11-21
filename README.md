@@ -144,7 +144,7 @@ Prompt and completion text is never recorded.
 
 ### Labels
 
-Every span carries ownership labels, modelled on a typical internal tracing standard. Each label has exactly one place where it lives:
+Every span carries `org.*` ownership labels, so traces can be filtered by team, service and tenant. Each label has exactly one place where it lives:
 
 | Label | Lives on | Set by | Required |
 |---|---|---|---|
