@@ -1,4 +1,4 @@
-# Module 5: Head and tail sampling (60 min)
+# Module 5: Head and tail sampling (65 min)
 
 ## Why this matters
 
@@ -27,25 +27,21 @@ that forwards spans to ClickHouse ([module 4](04-collector.md)).
 | **Orphan span** | A span whose parent was never recorded, so it hangs loose outside its tree |
 | **Policy** | One rule in tail sampling, such as "keep traces with an error" |
 | **Load balancer** | Something that spreads incoming requests across several copies (replicas) of a service |
+| **Adjusted count** | How many real traces one stored trace stands for: 1 divided by the chance it was kept |
 
 ## Idea
 
 ### Why sample at all?
 
-Here's a rough, made-up example of the volume involved. A service handles
-1,000 requests a second, and each request produces 20 spans. That's 20,000
-spans a second, or about 1.7 billion a day. Every one has to be sent over the
-network, held in the Collector, written to ClickHouse, and stored on disk.
-
-Most of those traces look the same: a normal request that succeeded at a
-normal speed. You don't need a million copies of "it worked". You need:
+A rough example: 1,000 requests a second at 20 spans each is 20,000 spans a
+second, about 1.7 billion a day, all sent, held, written and stored. Most say
+the same thing: "it worked, at normal speed". You need:
 
 - **every** trace where something failed,
 - **every** trace that was unusually slow,
 - **some** normal traces, to know what "normal" looks like.
 
-Sampling is how you keep that useful subset and pay for less. The key question
-is **when** you decide, because that decides **what you know** when you decide.
+The key question is **when** you decide, because that sets **what you know**.
 
 ### Head and tail: an analogy
 
@@ -76,20 +72,8 @@ recording and sending spans. The "editing room" is a Collector instance.
 | Cost | Almost nothing: dropped spans are never even sent | Every span is sent and held in Collector memory until the decision |
 | Scaling | Trivial: each service decides locally | Every span of a trace must reach **the same** Collector instance |
 
-```mermaid
-flowchart LR
-  subgraph App["App (SDK)"]
-    H{{"Head sampler:<br/>keep this trace?"}}
-  end
-  subgraph GW["Gateway (Collector)"]
-    T{{"Tail sampler:<br/>wait, then keep this trace?"}}
-  end
-  H -->|kept spans only| GW
-  T -->|kept traces only| CH[(ClickHouse)]
-```
-
-You can use either one, or both. If you use both, head sampling cuts the volume
-first, and tail sampling chooses among what's left.
+You can use either one, or both: head sampling cuts the volume first, and
+tail sampling chooses among what's left.
 
 ### Head sampling in the SDK
 
@@ -111,6 +95,15 @@ Flags `01` mean the caller sampled (kept) the trace; `00` means it dropped it.
 Only the lowest bit means "sampled". Newer versions of the standard use the
 next bit for something else (`02` says "this trace id is random"), so `03` also
 means sampled. Check the lowest bit, not the whole value.
+
+> **Quick check:** `ticket-api` receives `traceparent: 00-...-...-02`. With the
+> default sampler, does it record its span?
+>
+> <details><summary>Answer</summary>
+>
+> No. `02` has the lowest bit off, so the caller dropped the trace, and the
+> parent-based default follows that. Only the "random trace id" bit is set.
+> </details>
 
 The Python SDK picks its sampler from environment variables, so you don't
 change any code:
@@ -152,21 +145,28 @@ trace. That span points to a parent span id that was never stored. That's an
 **orphan**: a piece of a tree with no tree. Orphans make traces confusing and
 still cost storage.
 
-Because a ratio sampler decides from the trace id, two services using the same
-ratio and the same algorithm happen to make the same decision for the same
-trace. Don't rely on that coincidence: different ratios or SDKs break it.
-Use parent-based sampling in every service that isn't the start of a trace.
+Two services with the same ratio and algorithm happen to agree on the same
+trace id, but different ratios or SDKs break that. Use parent-based sampling
+in every service that isn't the start of a trace.
+
+> **Quick check:** The HR agent keeps 30% of turns with
+> `parentbased_traceidratio`, and `ticket-api` keeps 100% with `always_on`.
+> Out of 10 turns, how many `ticket-api` spans are orphans?
+>
+> <details><summary>Answer</summary>
+>
+> About 7: the turns the agent dropped. `ticket-api` records them anyway, and
+> their parent span was never stored.
+> </details>
 
 #### Stateless probabilistic sampling in a Collector
 
-There's one more option in between: the `probabilistic_sampler` processor in a
-Collector keeps a percentage of traces, chosen from the trace id. It isn't head
-sampling: the apps have already recorded and sent every span, so it saves
-nothing between the apps and the Collector. It isn't tail sampling either: it
-decides span by span as they pass, without holding traces in memory
-("stateless"), so it can't know whether a trace failed. Because every span of
-a trace has the same trace id, it still keeps or drops whole traces. It's
-useful when you can't change the apps' settings. This repo doesn't use it.
+The `probabilistic_sampler` processor sits in between. It keeps a percentage
+of traces chosen from the trace id, span by span, without holding traces in
+memory ("stateless"). So it saves nothing between apps and Collector (unlike
+head sampling) and can't see failures (unlike tail sampling), but it still
+keeps whole traces, since every span shares the trace id. Use it when you
+can't change the apps' settings. This repo doesn't.
 
 ### Tail sampling in the Collector
 
@@ -250,30 +250,36 @@ Other policy types exist: `string_attribute`, `numeric_attribute`,
 `boolean_attribute`, `rate_limiting`, `span_count`, `ottl_condition`,
 `trace_state`, `and` and `composite`.
 
+> **Quick check:** An HR turn has no errors and takes 0.8 s. Which policy can
+> keep it, and how likely is that?
+>
+> <details><summary>Answer</summary>
+>
+> Only `keep-10-percent-of-the-rest`, so about a 1 in 10 chance, decided by
+> its trace id. `keep-errors` and `keep-slow` don't match.
+> </details>
+
 ### The trade-offs of tail sampling
 
 **Memory.** Every span of every trace in its wait window sits in the gateway's
-memory. Roughly, `num_traces` times the average spans per trace must fit. Size
-`num_traces` for your traffic: too small and traces are removed before they're
-decided; too big and the gateway hits its `memory_limiter` (module 4) and starts
-refusing data.
+memory. Too small a `num_traces` and traces are removed before they're
+decided; too big and the gateway hits its `memory_limiter` (remember from
+module 4: the guard that refuses data near 410 MiB). The principal engineer's
+notes below work out the size.
 
-**Completeness and delay.** The processor can only judge what has arrived by the
-end of `decision_wait`. A longer wait catches slower traces, but holds more in
-memory and delays when data shows up in ClickHouse. Spans that arrive after the
-decision are "late". The processor tries to apply the earlier decision to them,
-but once the trace has left memory, a late span can be judged again on its own,
-as a fragment.
+**Completeness and delay.** The processor judges only what arrived within
+`decision_wait`. A longer wait catches slower traces but holds more memory and
+delays data in ClickHouse. A span arriving after the decision is "late": once
+the trace has left memory, it's judged again on its own, as a fragment.
 
 **Transport cost.** Unlike head sampling, every span still travels from the app
 to the gateway. Tail sampling saves the network from the gateway to ClickHouse,
 and the storage there, but not the network from the apps to the gateway.
 
-**One trace, one instance.** This is the big one. With several gateway
-replicas behind a load balancer, each span is sent to whichever replica is
-next. A trace's spans end up spread across replicas, and each replica sees only
-part of the trace. One might see the error and keep its part, while another
-sees only healthy spans and drops its part. You get fragments.
+**One trace, one instance.** This is the big one. Behind a plain load
+balancer, a trace's spans spread across gateway replicas. One replica sees the
+error and keeps its part; another sees only healthy spans and drops its part.
+You get fragments.
 
 The fix is two tiers of Collectors:
 
@@ -314,7 +320,9 @@ counted), errors, and duration (latency). Two ways to keep them right:
   `spanmetrics` connector, which turns every span into RED metrics and feeds
   them to a metrics pipeline. The second runs `tail_sampling` and writes the
   kept traces to ClickHouse. (Not in this repo.)
-- Or weight each stored trace by its sampling rate when you count.
+- Or weight each stored trace by its **adjusted count**: 1 divided by the
+  probability it was kept. A trace kept at 10% counts as 10; an error trace
+  kept at 100% counts as 1. This needs the probability stored with the trace.
 
 ```mermaid
 flowchart LR
@@ -329,12 +337,21 @@ minute) is filled by a materialized view: a query ClickHouse runs on every
 insert into `otel.otel_traces`. It only sees spans that were stored, so it would
 undercount if you turned sampling on permanently.
 
+> **Quick check:** With tail sampling on, a minute has 40 stored error traces
+> and 50 stored normal ones. Roughly how many turns really ran?
+>
+> <details><summary>Answer</summary>
+>
+> About 540: 40 errors at adjusted count 1, plus 50 normal traces at adjusted
+> count 10 (kept at 10%). Slow traces, also kept at 100%, would count as 1 each.
+> </details>
+
 ## Remember it
 
-> **Head sampling is a bouncer at the door: fast, cheap, but judges you before
-> the party. Tail sampling is a reviewer after the party: knows who caused
-> trouble, but has to watch everyone, and everyone from the same group has to
-> be watched by the same reviewer.**
+> **Head sampling picks which matches to film before kickoff: cheap, but blind
+> to the upset. Tail sampling films everything and an editor keeps the best
+> after the final whistle, which only works if all footage of one match
+> reaches the same editing room.**
 
 And: **parent-based means "do what your parent did"**, which is what keeps
 traces whole.
@@ -348,6 +365,51 @@ traces whole.
 - **Tail sampling**: `docs/tutorial/labs/otel-gateway-tail-sampling.yaml`,
   merged into the gateway by `docs/tutorial/labs/compose.tail-sampling.yaml`.
   It's off unless you start the gateway with that compose file.
+
+## Principal engineer's notes
+
+**Touch points**
+- Head sampling's contract is the `traceparent` sampled bit (touch point 1 in
+  the [module 0 map](00-setup.md#the-touch-points-map)). Any service whose
+  sampler ignores it breaks traces for everyone downstream.
+- Two-tier tail sampling adds a Collector-to-Collector OTLP hop. Tier 1 must
+  know the list of tier 2 instances (a static list, DNS, or Kubernetes
+  lookup in the `loadbalancing` exporter); that list is the new contract.
+
+**At scale**
+- Tail sampling memory is about **traces per second x `decision_wait` x
+  average trace size**. Worked example: 1,000 turns a second, a 10 s wait,
+  20 spans per turn at about 1 KB each: 10,000 traces in flight x 20 KB =
+  200 MB, before the Collector's own overhead (budget roughly double). That
+  already crowds this gateway's 410 MiB refusal point. `num_traces` must also
+  exceed traces in flight (10,000 here); the lab's 20,000 gives 2x headroom.
+- Agent turns are long. Child spans arrive as they finish, but the root
+  `agent_turn` span arrives only after the turn ends, plus up to 5 s in the
+  SDK's batch. `decision_wait` must cover the longest normal turn plus that
+  delay. A 30 s LLM-heavy turn needs about 40 s, which quadruples memory.
+- When tier 2 grows or shrinks, the `loadbalancing` exporter's hash ring
+  moves some trace ids to a different instance. Traces in flight at that
+  moment are split and decided twice, so you get fragments for about one
+  `decision_wait`. Scale tier 2 in quiet periods, not in the middle of an incident.
+
+**Operational issues**
+- Watch for traces evicted before a decision
+  (`otelcol_processor_tail_sampling_sampling_trace_dropped_too_early`) and late
+  spans; both mean `num_traces` or `decision_wait` is too small. More gateway
+  signals: [module 12](12-operations.md) and the
+  [metrics appendix](appendix-metrics-reference.md).
+- Head and tail together compound: at 10% head sampling, tail's "keep all
+  errors" only sees errors in that 10%.
+
+**Design trade-offs**
+- This repo stores everything by default and computes RED metrics with a
+  materialized view on stored spans. With permanent sampling, move RED to
+  before sampling (`spanmetrics`) so dashboards stay exact.
+- **Consistent probability sampling** is the standard way to keep counts
+  correct: each sampler writes the probability it used into the `tracestate`
+  header, so every stage agrees and any backend can compute the adjusted
+  count. Choose it when several stages sample, or when you need weighted
+  counts from stored traces.
 
 ## Lab (25 min)
 
@@ -480,15 +542,11 @@ Run SQL in <http://localhost:8123/play> (user `default`, password `demo`).
 
 ## Explain it back
 
-> "Head sampling decides in the SDK when the root span starts, usually as a
-> ratio of trace ids; it's free, but it can't know whether the trace will fail.
-> Children use parent-based sampling, so they follow the decision in the
-> `traceparent` flags and traces stay whole. Tail sampling decides in the
-> Collector after waiting for the whole trace, so it can keep all errors and
-> slow traces plus a percentage of the rest; the cost is memory, and every span
-> of a trace has to reach the same Collector, which at scale means a
-> load-balancing tier keyed by trace id. Either way, compute your metrics
-> before sampling, or weight them."
+> "Head sampling decides in the SDK when the root span starts: free, but blind
+> to failures. Children follow the `traceparent` flag, so traces stay whole.
+> Tail sampling decides in the Collector after the whole trace arrives, so it
+> keeps all errors and slow traces; it costs memory, and needs every span of a
+> trace on one instance. Compute metrics before sampling, or weight them."
 
 ## Recap
 
@@ -529,13 +587,13 @@ their last spans arrive; those late spans then arrive after the decision and
 can end up as fragments.
 </details>
 
-<details><summary>The agent uses <code>parentbased_traceidratio</code> at 0.3. What should the APIs it calls use, and why?</summary>
+<details><summary>You turn on tail sampling with <code>decision_wait: 10s</code>. The gateway's <code>otelcol_receiver_refused_spans_total</code> (module 4) starts rising during busy minutes. What's happening, and what are your options?</summary>
 
-A parent-based sampler, such as the default `parentbased_always_on` or
-`parentbased_traceidratio`. Their spans always have a parent (the agent's
-client span), so they just follow the agent's decision from the `traceparent`
-flags. A sampler that ignores the parent, like `always_on`, creates orphans, as
-in lab step 2.
+The traces held for their 10 s wait push gateway memory past the
+`memory_limiter` threshold, so it refuses new data and SDKs retry. Options:
+give the gateway more memory and raise `limit_mib`, shorten `decision_wait`
+(at the risk of incomplete traces), or add tier 2 instances behind a
+`loadbalancing` tier so each holds fewer traces.
 </details>
 
 <details><summary>With tail sampling on, the stored error rate jumps from 5% to 40%. Did the service get worse?</summary>

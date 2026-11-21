@@ -1,11 +1,11 @@
-# Module 8: The data model (35 min)
-
-This module reads `clickhouse/schema.sql` line by line: every column of the
-span table, the three summary tables, and the materialized views that fill
-them. It builds on [module 7](07-clickhouse.md), which explained parts,
-partitions, TTL, replication and materialized views in general.
+# Module 8: The data model (40 min)
 
 ## Why this matters
+
+Remember from [module 7](07-clickhouse.md): every insert becomes a sorted,
+immutable part, and a materialized view is an insert trigger. This module
+reads `clickhouse/schema.sql` line by line to see how *our* tables use that.
+
 
 `clickhouse/schema.sql` is the contract between the gateway and everyone who
 queries traces. Each column, type and setting in it was chosen for a reason:
@@ -74,7 +74,7 @@ Before the columns, the vocabulary they use:
 | In the DDL | What it means | Why it's used here |
 |---|---|---|
 | `String` | Text of any length | Ids and free text |
-| `LowCardinality(String)` | Text stored as a dictionary: each distinct value is stored once, and each row holds a small number pointing to it | Columns with few distinct values (service names, span kinds). Smaller and faster. Bad for unique values like ids, where the dictionary would be as big as the data |
+| `LowCardinality(String)` | Text stored as a dictionary: each distinct value is stored once, and each row holds a small number pointing to it | Columns with few distinct values (service names, span kinds); a good fit up to roughly 10,000. Bad for unique values like ids, where the dictionary would be as big as the data |
 | `DateTime64(9)` | A timestamp with 9 decimal places of seconds: nanoseconds | OpenTelemetry records times in nanoseconds |
 | `DateTime` | A timestamp to the second | Enough for sorting, time ranges and TTL |
 | `UInt64`, `UInt32`, `UInt16`, `UInt8` | Whole numbers, never negative, in 8, 4, 2 or 1 bytes | Durations, token counts, HTTP status codes, yes/no flags |
@@ -127,6 +127,15 @@ Three things to notice:
 - **Every stock column uses `ZSTD(1)`**, because spans are mostly text that
   repeats a lot. Module 7's lab measured `SpanAttributes` shrinking about
   13 times.
+
+> **Quick check:** A span has `Events.Name = ['retry', 'exception']`. Which
+> timestamp belongs to the exception?
+>
+> <details><summary>Answer</summary>
+>
+> `Events.Timestamp[2]`, the second item. `Nested` columns are parallel
+> arrays, so the same position in each array describes the same event.
+> </details>
 
 ### Group 2: the MATERIALIZED columns
 
@@ -230,6 +239,17 @@ columns exist: it inserts the stock columns, and ClickHouse fills in the rest.
 Because they're hidden from `SELECT *`, you name them explicitly in queries
 (`SELECT org_owner, ...`).
 
+> **Quick check:** Every dashboard filters on
+> `SpanAttributes['db.system.name']`. What would you suggest, and what does
+> it cost?
+>
+> <details><summary>Answer</summary>
+>
+> Promote it: add a `LowCardinality(String) MATERIALIZED` column (lab step
+> 7). Filters then read a tiny column instead of the whole map. The cost is a
+> little extra disk per row and a schema change to roll out on every server.
+> </details>
+
 ### The indexes
 
 The column list ends with nine `INDEX` lines: bloom filters on the trace,
@@ -249,21 +269,11 @@ TTL toDateTime(Timestamp) + INTERVAL 72 HOUR
 SETTINGS ttl_only_drop_parts = 1;     -- drop whole expired parts, don't rewrite them
 ```
 
-[Module 7](07-clickhouse.md) explained what each of these does in general:
-parts and merges, the sparse primary index, daily partitions with TTL, and
-the Keeper path `/clickhouse/tables/{uuid}/{shard}` that both replicas share.
-What's specific to this table:
-
-- **`ReplicatedMergeTree`** with no arguments uses that default Keeper path
-  and the `{replica}` macro, so the same DDL runs unchanged on every server.
-- **`PARTITION BY toDate(Timestamp)`**: a day of spans per partition.
-- **`ORDER BY (...)`**: owner, then service, then span name, then time.
-  There's no separate `PRIMARY KEY`, so this is also the primary index. Time
-  is cut to whole seconds with `toDateTime`, enough for sorting and time
-  filters.
-- **`TTL ... + INTERVAL 72 HOUR`** with **`ttl_only_drop_parts = 1`**: spans
-  expire 72 hours after they start, and ClickHouse drops whole parts, so
-  one day at a time.
+[Module 7](07-clickhouse.md) explained each clause in general. Two details
+specific to this table: `ReplicatedMergeTree` with no arguments uses the
+default Keeper path and the `{replica}` macro, so the same DDL runs unchanged
+on every server; and `toDateTime` cuts time to whole seconds in the key,
+enough for sorting and time filters.
 
 ### The derived tables
 
@@ -392,6 +402,16 @@ the parts holding them merge. Until then, all copies are visible. Add
 `SELECT ... FROM otel.trace_entry FINAL` returns one row per request, led by
 its root span. Lab step 6 shows both.
 
+> **Quick check:** For the HR request, which row survives in `trace_entry`,
+> and does it matter which batch arrived first?
+>
+> <details><summary>Answer</summary>
+>
+> The `agent_turn` row: it's the root (`IsRoot = 1`), and the `ticket-api`
+> row has `IsRoot = 0`. The highest version wins, so arrival order doesn't
+> matter.
+> </details>
+
 #### `span_red_1m`: the per-minute rollup
 
 RED stands for **Rate, Errors, Duration**: the three standard health numbers
@@ -453,16 +473,27 @@ still be spread over several rows. Always `GROUP BY` and use `sum(calls)`,
 `sum(errors)` and `quantilesMerge(...)(duration_q)`; never read single rows
 as if they were final. Lab step 4 does this.
 
+> **Quick check:** Why can't you read p95 straight from one row of
+> `span_red_1m`?
+>
+> <details><summary>Answer</summary>
+>
+> `duration_q` is an aggregation state, not a number, and one minute may
+> still be spread over several rows until they merge. Group the rows and
+> finish them with `quantilesMerge(0.5, 0.95, 0.99)(duration_q)`.
+> </details>
+
 ### Changing the schema
 
 - `ALTER TABLE ... ON CLUSTER tracing ADD COLUMN ...` goes through the DDL
-  queue in Keeper (`/clickhouse/task_queue/ddl`) and runs on every node.
-- A newly added `MATERIALIZED` column is computed **on read** for old parts,
-  until you run `MATERIALIZE COLUMN`. That starts a **mutation**: a
-  background job that rewrites existing parts, here to store the new column.
+  queue in Keeper (module 7) and runs on every server.
+- A new `MATERIALIZED` column is **stored only in parts written after the
+  `ALTER`**. For older parts, ClickHouse computes it on read, using the
+  column's *current* expression. `MATERIALIZE COLUMN` stores it in old parts
+  too; it's a **mutation**, a background job that rewrites existing parts.
 - Never rename or retype stock columns: the exporter would fail to insert.
-  Since `create_schema: false` in `otel-gateway-config.yaml`, the exporter
-  doesn't create or change tables; this table is yours to maintain.
+  With `create_schema: false`, the exporter never creates or changes tables;
+  this schema is yours to maintain.
 
 ## Remember it
 
@@ -478,6 +509,52 @@ as if they were final. Lab step 4 does this.
 - `clickhouse/schema.sql`: every table and view, with comments.
 - `otel-gateway-config.yaml`: `create_schema: false` and the table name
   (`traces_table_name: otel_traces`).
+
+## Principal engineer's notes
+
+**Touch points**
+- The exporter-to-table contract: the gateway's exporter inserts the 22 stock
+  columns by name and type, and `create_schema: false` means it trusts that
+  they exist. The platform team owns both sides. Exporter releases have
+  changed the stock schema before, so before upgrading the Collector, diff its
+  default DDL against `schema.sql` and add any new columns first.
+- Queries are the other contract. Dashboards depend on the promoted column
+  names and on reading the summary tables with `sum`, `-Merge` and `FINAL`.
+  Renaming a promoted column breaks them; add the new one, migrate
+  the queries, then drop the old.
+
+**At scale**
+- Materialized views run **synchronously**, inside every insert, on the
+  server that took it. Each gateway batch does four writes, not one. A slow
+  view (say, one with a `JOIN`) slows every batch; a failing view fails the
+  insert. The rows may already be in `otel_traces`, and a retry can be
+  deduplicated there, so the summary tables can miss that batch.
+- Measure codecs instead of guessing: `system.columns` gives compressed and
+  uncompressed bytes per column (module 7's lab). In a test run, `SpanName`
+  and `org_service` shrank over 80 times, `SpanAttributes` 12, `TraceId` 6,
+  but `Timestamp` only 1.7 despite `Delta`: rows are sorted by service and
+  name first, so neighbors aren't that close in nanoseconds. To try a codec,
+  copy a day into a `lab` table with it and compare.
+- `LowCardinality` pays off up to roughly 10,000 distinct values. Beyond
+  that, the dictionaries get big and it becomes slower than a plain
+  `String`. Ids and tenants with unbounded growth stay `String`.
+
+**Operational issues**
+- Schema changes without downtime: `ADD COLUMN` is instant, because old parts
+  are untouched. But the new column is only stored in new parts, and old parts
+  compute it on read with the *current* expression, so changing the
+  expression later silently changes history. `MATERIALIZE COLUMN` fixes the
+  values, at the price of a mutation that rewrites every part: run it on a
+  quiet day, and watch `system.mutations`.
+- A skip index added later also covers only new parts until
+  `MATERIALIZE INDEX` (module 9).
+
+**Design trade-offs**
+- Maps plus promoted columns, versus one column per attribute: maps accept
+  any attribute with no schema change, but every lookup reads the whole map.
+  Promote a key when it's filtered or grouped on most days, needs to be a
+  number, or should be in the sorting key or an index. Each promoted column
+  adds files per part and merge work, so promote dozens, not hundreds.
 
 ## Lab (15 min)
 
@@ -738,13 +815,6 @@ eventually. Use `FINAL`, or `argMax(..., IsRoot)` with `GROUP BY`, for exact
 answers now.
 </details>
 
-<details><summary>For the HR request, which row survives in <code>trace_entry</code>, and why?</summary>
-
-The `agent_turn` row. It's the root span, so `IsRoot = 1`, and the
-`ticket-api` row has `IsRoot = 0`. `ReplacingMergeTree(IsRoot)` keeps the row
-with the highest version, whatever order the rows arrived in.
-</details>
-
 <details><summary>Why are <code>calls</code> and <code>errors</code> <code>SimpleAggregateFunction(sum, UInt64)</code> instead of <code>UInt64</code>?</summary>
 
 `AggregatingMergeTree` merges rows with the same key. It adds up
@@ -752,18 +822,19 @@ with the highest version, whatever order the rows arrived in.
 one row's value, so the counts would shrink as parts merge.
 </details>
 
-<details><summary>Why can't you just read <code>duration_q</code> from one row of <code>span_red_1m</code>?</summary>
-
-It's an aggregation state, not a number, and one minute may still be spread
-over several rows (one per insert) until they merge. Group the rows and
-finish the states with `quantilesMerge(0.5, 0.95, 0.99)(duration_q)`.
-</details>
-
 <details><summary>You add a MATERIALIZED column. Do old spans have a value?</summary>
 
 Yes, when you query: ClickHouse computes it on read for parts written before
 the column existed. `MATERIALIZE COLUMN` starts a mutation that stores it in
 those parts, so reads no longer have to compute it.
+</details>
+
+<details><summary>You run the <code>ADD COLUMN ... ON CLUSTER tracing</code> from lab step 7 while <code>clickhouse-02</code> is stopped. What happens? (Uses module 7.)</summary>
+
+`clickhouse-01` adds the column, and the statement waits, then reports a
+timeout for `clickhouse-02` after `distributed_ddl_task_timeout` (180 s). The
+task stays in Keeper's DDL queue, and `clickhouse-02` runs it when it starts.
+Until then the replicas have different schemas.
 </details>
 
 ## Next

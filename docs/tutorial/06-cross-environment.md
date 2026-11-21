@@ -1,4 +1,4 @@
-# Module 6: Joining services and environments into one trace (30 min)
+# Module 6: Joining services and environments into one trace (35 min, plus 10 for the Part 1 review)
 
 ## Why this matters
 
@@ -48,21 +48,20 @@ stores spans ([module 4](04-collector.md)).
 
 ### Recap: one hop, from module 1
 
-The running example: a user asks the HR assistant, "I need a new laptop." The
-`hr-agent` runs its `create_ticket` tool, which calls `ticket-api` over HTTP.
+Remember from [module 1](01-otel-core.md#propagation-carrying-context-across-the-network):
+context is the "current span" badge, and propagation copies it into request
+headers. In the running example ("I need a new laptop"), `hr-agent`'s
+`create_ticket` tool calls `ticket-api`:
 
 1. `call_api` in `agent/telemetry.py` opens a client span, `POST /v1/tickets`,
-   and calls `propagate.inject(headers)`. That writes `traceparent` (trace id
-   plus the client span's id) and `baggage` (`org.request_id`, `org.tenant`).
+   and `propagate.inject(headers)` writes `traceparent` (trace id plus the
+   client span's id) and `baggage` (`org.request_id`, `org.tenant`).
 2. `ticket-api` (`agent/apis.py`) calls `propagate.extract(...)` and starts
-   its server span with `context=parent`. The server span gets the same trace
-   id, and its parent is the client span.
+   its server span from that context: same trace id, parent = the client span.
 3. Each process exports only its own spans. There is **no merge step**: the
    shared trace id *is* the join.
 
-[Module 1](01-otel-core.md#propagation-carrying-context-across-the-network)
-walks through the code and the `traceparent` format. The rest of this module
-asks: what has to go right, on every hop, for that to keep working?
+What has to go right, on every hop, for that to keep working?
 
 ### The checklist: five conditions per service
 
@@ -98,10 +97,20 @@ calls by hand so you can see them.
 
 **Callees you can't instrument.** You still get the caller's **client span**,
 with its duration, status and error, but nothing inside the callee.
-`INSERT tickets` from `ticket-api` to Postgres is such a span here: `ticket-api`
-records how long the insert took, and that's all. Beyond that, the fallback is
-matching on a business id the callee logs (such as `org.request_id`). That's a
-workaround, not a trace.
+`INSERT tickets` from `ticket-api` to Postgres is such a span here. Beyond
+that, the fallback is matching on a business id the callee logs (such as
+`org.request_id`): a workaround, not a trace.
+
+> **Quick check:** `ticket-api` is instrumented and extracts correctly, but
+> its resource has `org.service` and no `org.owner`. Which condition fails,
+> and what do you see in ClickHouse?
+>
+> <details><summary>Answer</summary>
+>
+> Condition 4. The gateway's filter drops its spans, so the agent's
+> `POST /v1/tickets` client span has nothing under it, exactly like
+> `legacy-hr-api` today.
+> </details>
 
 ### What breaks the chain
 
@@ -109,9 +118,8 @@ Each failure leaves a recognizable mark in storage.
 
 **1. Something in between strips the headers.** Proxies, API gateways, load
 balancers and WAFs (web application firewalls) sometimes drop headers they
-don't recognize. The request still arrives, but without `traceparent` and
-`baggage`. The service extracts an empty context, so its server span becomes
-the root of a brand-new trace, and the tenant from baggage is gone.
+don't recognize. The service then extracts an empty context: its server span
+becomes the root of a brand-new trace, and the tenant from baggage is gone.
 
 This repo can fake that proxy. In `agent/apis.py`:
 
@@ -131,17 +139,22 @@ Healthy:   agent ──traceparent──▶ proxy ──traceparent──▶ api
 Stripped:  agent ──traceparent──▶ proxy ───(nothing)───▶ api      two traces
 ```
 
-**2. The service's spans never reach storage.** The gateway's
-`filter/require_org_labels` drops spans whose resource lacks `org.owner` or
-`org.service`; `legacy-hr-api` puts them on the span instead
-([module 4](04-collector.md)). Mark: a client span with nothing under it.
+> **Quick check:** With `STRIP_TRACE_HEADERS=1`, one "I need a new laptop"
+> turn runs. How many traces does it leave in ClickHouse?
+>
+> <details><summary>Answer</summary>
+>
+> Two: the agent's trace, and a new one rooted at `ticket-api`'s server span.
+> `legacy-hr-api` would start a third, but the gateway drops its spans.
+> </details>
 
-**3. Orphan spans.** The callee kept its span but the caller's sampler
-dropped the parent, because the two didn't agree
-([module 5](05-sampling.md)). Mark: a `ParentSpanId` that matches no row.
+The other failures leave these marks:
 
-**4. The callee emits nothing.** Not a breakage: the client span is all you
-will ever get for an uninstrumented callee.
+| Failure | Mark in storage |
+|---|---|
+| Spans dropped on the way (gateway filter, [module 4](04-collector.md)) | A client span with nothing under it |
+| Samplers disagree ([module 5](05-sampling.md)) | A `ParentSpanId` that matches no row (an orphan) |
+| Uninstrumented callee (not a breakage) | A client span with nothing under it, forever |
 
 ### Across environments
 
@@ -156,29 +169,37 @@ more things have to hold:
 | 3 | **Sampling decisions agree** | Each side samples independently | Parent-based sampling everywhere; tail sampling only where all spans of a trace meet ([module 5](05-sampling.md)) |
 | 4 | **You can tell environments apart** | Same service name in both; no environment label | Each environment's gateway stamps `org.env`, `org.region` and so on |
 
-Requirement 4 is why the environment labels are set by the gateway, not by
-the services. A service doesn't need to know where it runs; the gateway in
-each environment knows, and stamps every span passing through with `upsert`,
-which overwrites whatever the service sent ([module 4](04-collector.md)). So
-`org.env` is the authoritative environment label. You'll see in lab step 1
-that a service's own `deployment.environment.name` can say something else.
+Requirement 4 is why each environment's gateway, not the service, stamps
+`org.env` (remember from module 4: `upsert` overwrites what the app sent).
+Lab step 1 shows a service's own `deployment.environment.name` saying
+something else.
+
+> **Quick check:** The dev gateway forwards to a central gateway that also
+> runs `resource/org_platform` with `ORG_ENV=central`. What `org_env` do
+> dev's spans end up with?
+>
+> <details><summary>Answer</summary>
+>
+> `central`: the last `upsert` wins, and the environment is lost. Only the
+> first gateway a span enters should stamp environment labels; the central
+> tier should use `insert` (set only if missing) or not touch them.
+> </details>
 
 ### Clock skew
 
 Each host timestamps its own spans with its own clock. If two clocks differ by
 a few milliseconds, a server span in `prod` can appear to start before its
-client span in `dev`, which is impossible in reality. Trust the parent/child
-ids over the timestamps, and keep hosts in sync with NTP (the Network Time
-Protocol). Don't compute "time spent in the network" from timestamps taken on
-two different hosts unless you know their clocks agree.
+client span in `dev`. Trust the parent/child ids over the timestamps, keep
+hosts in sync with NTP (the Network Time Protocol), and don't compute network
+time from timestamps taken on two hosts.
 
 ### Trust boundaries
 
 At a public edge, you may *not* want to continue a caller's trace. An outside
 client could set the "sampled" flag to force you to keep everything, or send
 made-up trace ids that collide with yours. Start a new trace there, and add a
-**span link** to the incoming context, so the relationship is still recorded
-without letting outsiders control your trace ids or sampling.
+**span link** to the incoming context: the relationship is recorded, but
+outsiders don't control your trace ids or sampling.
 
 ### Architecture patterns
 
@@ -215,11 +236,10 @@ A `Distributed` table (a table that forwards queries to a list of servers,
 way, the trace id is the join key. Copying data between ClickHouse servers,
 including `remote()`, is covered in [module 10](10-copying-data.md).
 
-**C. Propagation was lost: correlate after the fact.** If something on the
-way drops the trace headers, the two halves have different trace ids, and no
-storage trick can rejoin them reliably. You can correlate on a business id
-that survives (an `X-Request-Id` header the proxy keeps, a ticket id), but
-it's a workaround. **Fix the propagation.**
+**C. Propagation was lost: correlate after the fact.** The two halves have
+different trace ids, and no storage trick rejoins them reliably. Correlating
+on a surviving business id (an `X-Request-Id`, a ticket id) is a workaround.
+**Fix the propagation.**
 
 ## Remember it
 
@@ -243,6 +263,46 @@ it's a workaround. **Fix the propagation.**
 In ClickHouse, `org.env` also has its own column, `org_env`, which the table
 fills automatically from the resource attribute (module 8 explains how), so
 you can filter and group on it directly.
+
+## Principal engineer's notes
+
+**Touch points**
+- The cross-service contract is the W3C header pair `traceparent` and
+  `baggage` (touch point 1 in the [module 0 map](00-setup.md#the-touch-points-map)).
+  Every service must agree on the format: a service configured only for
+  Zipkin's B3 headers can't read W3C ones. `OTEL_PROPAGATORS` (default
+  `tracecontext,baggage`) can list several.
+- Proxies, API gateways and service meshes sit on that contract without
+  owning it. A mesh sidecar can create spans for each hop, but it can't carry
+  context *through* your process: the app must still extract and inject. An
+  API gateway that starts a new trace instead of continuing it splits every
+  request. Test each hop by sending a known `traceparent` and checking it
+  comes out the other side.
+
+**At scale**
+- Async boundaries don't fit parent-child. Put `traceparent` in the message
+  headers; the consumer starts its own span with a **span link** to the
+  producer. A batch job that processes 500 messages is one span with up to
+  500 links, not 500 parents; otherwise one trace stays "open" for hours.
+- Central collection concentrates load and cost in one tier. Size it like
+  any gateway ([module 4](04-collector.md)), and keep tail sampling there.
+
+**Operational issues**
+- Inbound context from the internet is untrusted. Besides forced sampling,
+  baggage is forwarded to every downstream, including third parties: strip
+  it at the edge, and never put secrets or personal data in it.
+- `org.tenant` here comes from baggage, which the caller controls. Fine for
+  analysis; never use it for access control or billing without checking it.
+  For real tenant isolation, use separate pipelines or tables, or row-level
+  policies in ClickHouse, so one tenant can't read or flood another's data.
+- For third-party APIs you can't instrument, record the vendor's request id
+  on your client span, so their support team can find the other half.
+
+**Design trade-offs**
+- Central collection (pattern A) gives one place to query and sample; store
+  per environment (pattern B) when data-residency rules or blast radius
+  matter more than query convenience. Many teams do both: details stay local,
+  a central store holds a sampled copy.
 
 ## Lab (15 min)
 
@@ -401,34 +461,27 @@ reads to add resource labels). That lets each query pick out just that run.
 
 ## Explain it back
 
-> "To see one trace across services and environments, five things must hold
-> per service: the caller injects, the callee extracts, every hop forwards the
-> headers, the callee's spans reach the same store and pass its rules, and
-> sampling is parent-based. Across environments, the spans also have to be
-> queryable together, either by forwarding every environment's gateway to a
-> central store, or by querying each store by trace id at read time. Each
-> environment's gateway stamps `org.env`, which is the label to trust. There's
-> no merge step: the shared trace id *is* the merge. If propagation breaks,
-> you get two unrelated traces, and the only way back is correlating on a
-> business id."
+> "Five things must hold per service: the caller injects, the callee
+> extracts, every hop forwards the headers, the spans reach the same store and
+> pass its rules, and sampling is parent-based. Across environments, the spans
+> must also be queryable together: one central store, or each store queried by
+> trace id. The first gateway stamps `org.env`, the label to trust. The shared
+> trace id *is* the merge; if propagation breaks, only a business id is left."
 
 ## Recap
 
-- Spans from different services form one trace because they share a **trace
-  id** and each server span points at its caller's client span. Nothing is
-  merged afterwards.
+- Spans form one trace because they share a **trace id** and each server span
+  points at its caller's client span. Nothing is merged afterwards.
 - Five conditions per service: inject, extract, headers forwarded, spans
   stored, parent-based sampling. Each failure has its own mark in storage.
-- Anything that drops the headers (a proxy, a queue, `STRIP_TRACE_HEADERS=1`)
-  splits the request into unrelated traces, with the callee's span as a new
-  root and no baggage.
-- A client span with no server span under it means: the callee isn't
-  instrumented, its spans were dropped (like `legacy-hr-api`), or propagation
-  broke.
-- Across environments, each gateway stamps `org.env` and friends, which beat
-  whatever the service says. Store centrally, or query each store by trace id.
-- Trust ids over timestamps (clock skew), and start a new trace with a span
-  link at a public edge (trust boundary).
+- Dropped headers (a proxy, a queue, `STRIP_TRACE_HEADERS=1`) split the
+  request into unrelated traces, with the callee as a new root and no baggage.
+- A client span with nothing under it: uninstrumented callee, dropped spans,
+  or broken propagation.
+- Across environments, each gateway stamps `org.env`. Store centrally, or
+  query each store by trace id.
+- Trust ids over timestamps (clock skew); at a public edge, start a new trace
+  with a span link (trust boundary).
 
 ## Check yourself
 
@@ -458,13 +511,6 @@ edge). Look at the first server span on the far side: an empty
 `ParentSpanId` means it started a new trace.
 </details>
 
-<details><summary>With <code>STRIP_TRACE_HEADERS=1</code>, why is <code>org.tenant</code> missing on <code>kb-search-api</code> spans as well?</summary>
-
-The tenant travels in the `baggage` header, which is stripped along with
-`traceparent`. The API copies `org.tenant` from baggage onto its server span,
-so with no baggage there is nothing to copy.
-</details>
-
 <details><summary>In lab step 1, both services say <code>deployment.environment.name = local</code>, but <code>org_env</code> says <code>dev</code> and <code>prod</code>. Which do you trust, and why?</summary>
 
 `org.env`. It's stamped by the gateway in the environment the span passed
@@ -472,13 +518,6 @@ through, and `upsert` overwrites anything the service sent.
 `deployment.environment.name` is whatever the service's code set, and here the
 code hard-codes `local`; `OTEL_RESOURCE_ATTRIBUTES` can add keys but not
 override it.
-</details>
-
-<details><summary>A server span in prod starts 3 ms before its parent client span in dev. Is the trace broken?</summary>
-
-No. That's clock skew: each host stamps its own spans with its own clock. The
-parent/child ids are correct, so trust them over the timestamps, and keep the
-hosts' clocks in sync.
 </details>
 
 <details><summary>Why not tail sample in each environment's gateway?</summary>
@@ -495,10 +534,74 @@ link to the caller's context. That keeps the relationship visible without
 letting outside callers control your trace ids or sampling.
 </details>
 
+## Part 1 review (10 min)
+
+This ends part 1: how spans are made, labeled, carried and collected. These
+questions mix modules 0 to 6. Try each before opening the answer.
+
+<details><summary>1. Someone changes the gateway's host port from 14318 to 24318 in <code>compose.yaml</code> and tells no one. Which touch point breaks, and why don't the gateway's counters show it? (modules 0, 1, 4)</summary>
+
+Touch point 2. The SDKs get "connection refused", retry, then drop spans
+(module 4, lab 4). The gateway never receives anything, so none of its
+refused or dropped counters move; only `otelcol_receiver_accepted_spans_total`
+stops growing. Alert on spans arriving, not just on errors.
+</details>
+
+<details><summary>2. A tool's HTTP client span shows up as the root of its own trace instead of under the <code>execute_tool</code> span. The tool was recently changed to run in a thread pool. Why? (modules 1, 2)</summary>
+
+Context (the "current span" badge) lives per thread and per async task. Work
+handed to a new thread starts without it, so `call_api` sees no current span
+and starts a new trace. Copy the context into the worker (for example with
+`contextvars.copy_context()`).
+</details>
+
+<details><summary>3. Why is <code>org.tenant</code> carried in baggage and copied onto spans, rather than set on <code>ticket-api</code>'s resource? (modules 1, 6)</summary>
+
+The resource describes the process, and one `ticket-api` process serves many
+tenants. The tenant is a fact about each request, so it travels with the
+request (baggage) and lands on each span. And since the caller sets it, don't
+trust it for access control.
+</details>
+
+<details><summary>4. With tail sampling on, a cost dashboard sums <code>gen_ai.usage.input_tokens</code> over stored chat spans. Is the total right? (modules 3, 5)</summary>
+
+No, it's too low. Normal traces are kept at 10%, so each stands for about 10
+real ones; errors and slow traces count once. Weight by adjusted count, or
+compute token totals before sampling. Summing only chat spans is right,
+because tokens are stored once, there.
+</details>
+
+<details><summary>5. The HR agent (dev) uses <code>parentbased_traceidratio</code> at 0.3. <code>ticket-api</code> (prod) uses the default sampler, and the prod gateway tail samples with <code>keep-errors</code>. <code>ticket-api</code> fails on a turn the agent dropped. Is the error stored? (modules 5, 6)</summary>
+
+No. The agent sent flags `00`, so `ticket-api`'s parent-based sampler never
+recorded its span, and the tail sampler never saw the error. Head sampling
+runs first and wins. (Each environment tail sampling its own half would also
+cut traces in two.)
+</details>
+
+<details><summary>6. Trace a failure end to end: a user says "my laptop request failed around 10:02". Walk from the user to the cause.</summary>
+
+1. **Find the turn.** Search by request id (`org_request_id`, indexed) or by
+   `ServiceName = 'hr-agent' AND SpanName = 'agent_turn'` near 10:02 with
+   `StatusCode = 'Error'`. That gives the trace id.
+2. **Read the tree.** `SELECT SpanName, ServiceName, StatusCode, SpanId,
+   ParentSpanId FROM otel.otel_traces WHERE TraceId = '...' ORDER BY
+   Timestamp`. Follow the errors down: `agent_turn`, then the `create_ticket`
+   tool span, then the `POST /v1/tickets` client span.
+3. **Cross the hop.** Is there a `ticket-api` server span under that client
+   span? If yes, its status and its own children (such as `INSERT tickets`)
+   show where it failed. If not, use module 6's marks: uninstrumented,
+   dropped by the gateway filter, sampled away, or headers stripped (look for
+   a `ticket-api` root span at the same moment in another trace).
+4. **If the turn itself is missing,** check delivery (module 4): refused,
+   filtered, `enqueue_failed` and `send_failed` counters, and whether the
+   agent exited during a gateway outage.
+</details>
+
 ## Next
 
 You've seen how spans from many services and environments end up in one
-table. [Module 7](07-clickhouse.md) opens that table up: how ClickHouse writes
+table. Part 2 starts with [module 7](07-clickhouse.md): how ClickHouse writes
 spans to disk, why queries on it are fast, and how two replicas and Keeper
 keep the data safe when a server fails.
 

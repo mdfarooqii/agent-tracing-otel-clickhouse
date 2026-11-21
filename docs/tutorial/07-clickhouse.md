@@ -1,14 +1,18 @@
-# Module 7: ClickHouse storage, replicas and Keeper (40 min)
+# Module 7: ClickHouse storage, replicas and Keeper (45 min)
+
+> **Where we are.** Part 1 (modules 0 to 6) followed a span from the Python
+> code to the gateway: the SDK creates spans, the gateway checks, samples and
+> batches them, and trace headers join services into one trace. Part 2 starts
+> here, at the database end of the pipe: touch points 3 to 5 on the
+> [touch points map](00-setup.md#the-touch-points-map).
 
 ## Why this matters
 
 Every span the agents produce ends up as a row in ClickHouse, the database
-this repo uses to store traces. [Module 6](06-cross-environment.md) showed
-how spans from many services and environments land in one table. This module
-looks inside that table. To understand why queries are fast, why
-the gateway sends spans in batches, and what breaks when a server goes
-down, you need a picture of how ClickHouse writes data to disk and how
-it keeps two copies in sync.
+this repo uses to store traces. This module looks inside that table. To
+understand why queries are fast, why the gateway sends spans in batches, and
+what breaks when a server goes down, you need a picture of how ClickHouse
+writes data to disk and how it keeps two copies in sync.
 
 **What you'll be able to do after this module:**
 
@@ -136,12 +140,21 @@ say), parts pile up faster than merges can combine them. Queries get slower,
 because they have to open many small parts, and eventually ClickHouse
 rejects inserts with a **"too many parts"** error.
 
-That's why the gateway **batches**: its `batch` processor collects spans and
-sends one insert when 1000 have arrived or 5 seconds have passed, whichever
-comes first (`otel-gateway-config.yaml`). For setups
-with many small clients and no batching layer, ClickHouse offers
-`async_insert`: the server collects small inserts in memory and writes them
-as one part.
+That's why the gateway **batches**. Remember from [module 4](04-collector.md):
+the `batch` processor sends one insert when 1000 spans have arrived or 5
+seconds have passed, whichever comes first. For setups with many small
+clients and no batching layer, ClickHouse offers `async_insert`: the server
+collects small inserts in memory and writes them as one part.
+
+> **Quick check:** Someone sets the gateway's batch size to 10 spans "for
+> fresher data", and you run 20 gateways. What do you expect in ClickHouse?
+>
+> <details><summary>Answer</summary>
+>
+> About 100 times more parts per second than with 1000-span batches. Merges
+> fall behind, queries open many tiny parts, and inserts start being delayed
+> and then rejected with "too many parts".
+> </details>
 
 ### The sorting key and the sparse primary index
 
@@ -190,18 +203,23 @@ mark 4 ─▶ ('sales-eng',   'sales-agent',   'agent_turn', 09:00:00)   ◀─ 
 ```
 
 For `WHERE org_owner = 'people-tech' AND org_service = 'hr-agent'`,
-ClickHouse looks at the marks and reads granules 1, 2 and 3. Granules 2 and
-3 start with `hr-agent` rows. Granule 1 starts with `support-agent` rows, but
-it runs up to where granule 2 begins, so its last rows *could* be `hr-agent`
-rows (with a span name that sorts before `agent_turn`); a mark only tells
-ClickHouse where a granule starts. Granules 0 and 4 can't match, so they're
-skipped. (The values above are only an illustration; real granules hold 8192
-rows each.)
+ClickHouse reads granules 1, 2 and 3 and skips 0 and 4. Why granule 1? A
+mark only says where a granule *starts*; granule 1 runs until granule 2
+begins, so its last rows could already be `hr-agent` rows. (The values are
+an illustration; real granules hold 8192 rows each.)
 
 The index works best for filters on the **start** of the key (owner, then
-owner and service, and so on). A filter on a column that isn't in the key
-at all, like `TraceId = '...'`, can't use it, and ClickHouse would read
-every granule. Module 9 covers the extra indexes that fix that.
+owner and service, and so on).
+
+> **Quick check:** A query filters on `TraceId` only. Can the primary index
+> help?
+>
+> <details><summary>Answer</summary>
+>
+> No. `TraceId` isn't in the sorting key, so the marks say nothing about
+> where a trace id is, and ClickHouse reads every granule. Module 9 covers
+> the bloom filter index and lookup table that fix this.
+> </details>
 
 **Choosing a key.** Pick it from your most common filters, and put
 **low-cardinality columns first** (cardinality is the number of distinct
@@ -241,6 +259,15 @@ Keep partitions coarse: one per day is good. One per hour, or one per
 service, multiplies the number of parts and brings back the "too many
 parts" problem.
 
+> **Quick check:** Why would `PARTITION BY ServiceName` be a bad idea?
+>
+> <details><summary>Answer</summary>
+>
+> Parts never merge across partitions, so services times days means many
+> small parts that can't be combined, slower queries and "too many parts".
+> Partition by time, for retention; put the service in the sorting key.
+> </details>
+
 ### Materialized views are insert triggers
 
 **The problem.** Some questions are asked all the time: "list today's
@@ -262,14 +289,12 @@ Here, every span insert into `otel_traces` also fills three smaller tables:
 | `trace_entry` | "List recent requests": the trace list page |
 | `span_red_1m` | Rate, errors and duration (RED) per service and span name per minute, kept 1 year |
 
-So the HR laptop request's spans land in `otel_traces`, and every span
-updates the per-minute counts in `span_red_1m`. Its `agent_turn` span (the
-root) and `ticket-api`'s server span both carry the request id, so both add
-a row to `trace_entry`. That table is a `ReplacingMergeTree`, which keeps one
-row per key when parts merge, preferring the root span. Read it with `FINAL`
-(merge at query time) and you get one row per request, led by its root span;
-without `FINAL` you may briefly see both rows until a background merge runs.
-[Module 8](08-data-model.md) walks through each table and its engine.
+So the HR laptop request's spans land in `otel_traces`, every span updates
+the per-minute counts in `span_red_1m`, and its entry spans add rows to
+`trace_entry`. Because a view sees only one insert at a time, these tables
+can hold several rows for the same request or minute until merges combine
+them. [Module 8](08-data-model.md) shows how each table's engine handles
+that, and how to read them correctly.
 
 ### Replication: why one server isn't enough
 
@@ -340,7 +365,16 @@ times out before the "OK" comes back, and the gateway sends the same batch
 again. Replicated tables keep a hash (a short fingerprint) of each recent
 inserted block in Keeper, in a node called `blocks`. If an identical block
 arrives again, ClickHouse ignores it. So retries don't create duplicate
-spans.
+spans, as long as the retried batch is byte-for-byte the same and among the
+last 1000 blocks (`replicated_deduplication_window`).
+
+> **Quick check:** Does span data pass through Keeper during replication?
+>
+> <details><summary>Answer</summary>
+>
+> No. Keeper holds the log entry "part X exists on replica A"; replica B
+> downloads the part from replica A directly, over port 9009.
+> </details>
 
 ### Keeper: the coordinator
 
@@ -373,6 +407,14 @@ a single voting member, and ClickHouse servers connect to it on port 9181.
 With one member the majority is 1, so it works alone; but if it stops,
 replicated tables can't accept writes.
 
+> **Quick check:** Why run 3 Keepers in production, not 2?
+>
+> <details><summary>Answer</summary>
+>
+> With 2 nodes the majority is 2, so losing either one stops Keeper: no
+> better than 1. With 3 the majority is still 2, so it survives one failure.
+> </details>
+
 ### Failure modes
 
 | What fails | What you see | What happens to data |
@@ -384,25 +426,15 @@ replicated tables can't accept writes.
 | **Disk full** | Inserts and merges fail | Same as an outage |
 | **Lag** | `absolute_delay` and `queue_size` grow in `system.replicas` | Reads from that replica are stale |
 
-Why each one behaves that way:
+The two rows worth reasoning through:
 
 - **Keeper down.** A replica can't write a part without logging it in
-  Keeper; otherwise the other replica would never hear about it. So
-  replicated tables refuse writes (read-only). Reading needs only the local
-  parts, so selects keep working. The gateway holds failed batches in its
-  queue and retries them (`retry_on_failure` in `otel-gateway-config.yaml`,
-  for up to 300 seconds), so a short Keeper outage loses nothing.
-- **One replica down.** The other replica still has Keeper and takes all
-  writes. When the stopped replica returns, it reads the log in Keeper,
-  sees the parts it missed, and fetches them from its peer.
-- **Both replicas down.** There's nowhere to write. The gateway retries for
-  300 seconds; after that, it gives up on those batches and they're lost.
-- **Too many small inserts.** See "Parts and background merges" above.
-- **Disk full.** A new part can't be written, and a merge can't write its
-  output either.
-- **Lag.** A replica that's busy or was down has a backlog of parts to fetch
-  (`queue_size`) and is behind by some seconds (`absolute_delay`). Queries
-  on it see slightly old data until it catches up.
+  Keeper, or the other replica would never hear about it, so replicated
+  tables refuse writes. Reading needs only local parts, so selects work. The
+  gateway's `retry_on_failure` holds failed batches for up to 300 seconds.
+- **One replica down.** The other still has Keeper and takes all writes.
+  When the stopped one returns, it reads the log in Keeper, sees the parts
+  it missed, and fetches them from its peer.
 
 ## Remember it
 
@@ -432,6 +464,55 @@ Why each one behaves that way:
 [Module 8](08-data-model.md) walks through every table's DDL (the
 `CREATE TABLE` statements). Adding a replica and copying data to another
 ClickHouse server are in [module 10](10-copying-data.md).
+
+## Principal engineer's notes
+
+**Touch points**
+- Gateway to ClickHouse (native protocol, `9000`): one `INSERT` per batch.
+  Failover to `clickhouse-02` happens when a connection fails, not when an
+  insert is rejected; a read-only `clickhouse-01` means retries, not failover.
+- ClickHouse to Keeper (`9181`): every insert into a replicated table means
+  several Keeper writes (log entry, block hash, part list). One span batch
+  into `otel_traces` is four replicated inserts, because each view's target
+  table is replicated too.
+- Replica to replica (`9009`): whole parts, so network cost is roughly
+  insert volume times (replicas - 1).
+
+**At scale**
+- Insert rate, not row count, is what hurts first. Aim for few, large
+  inserts: thousands to a hundred thousand rows each, about one per second
+  per table. To grow, raise `send_batch_size` before adding inserting clients.
+- `async_insert` moves batching into the server instead. Trade-offs: the
+  buffer lives in server memory; with `wait_for_async_insert = 0` the client
+  gets "OK" before the data is on disk, so a crash loses it. Choose it when
+  many clients you don't control insert directly, with no gateway.
+- "Too many parts" is a per-partition limit. In 25.8, at 1000 active parts in
+  one partition (`parts_to_delay_insert`) inserts are slowed down; at 3000
+  (`parts_to_throw_insert`) they fail. Reaching it means merges are falling
+  behind: slow disk, too little CPU, or too many tiny inserts.
+- Keeper load grows with inserts times replicated tables. Keeper waits for
+  its disk on every write, so give it fast local SSDs (not the ClickHouse data
+  disk), and run 3 nodes for a quorum that survives one failure.
+- Memory: a `GROUP BY TraceId` over days can hit the server limit (90% of
+  RAM here, no per-query limit). Set `max_memory_usage` per user, and
+  `max_bytes_before_external_group_by` / `_sort` to spill to disk instead.
+
+**Operational issues**
+- Replication lag is silent: a lagging replica answers queries with old
+  data, so counts can jump when a load balancer switches replicas. Alert on
+  `absolute_delay` ([module 12](12-operations.md)).
+- Stuck `ON CLUSTER` DDL: if a host is down, the statement times out after
+  `distributed_ddl_task_timeout` (180 s) but stays queued and runs when the
+  host returns. Look in `system.distributed_ddl_queue` before re-running it.
+- Version upgrades: pin the image (25.8, a long-term-support release, here),
+  upgrade one replica at a time, wait for `queue_size = 0` before the next,
+  and upgrade Keeper separately.
+
+**Design trade-offs**
+- Replication is asynchronous with no `insert_quorum`: fast inserts, but if
+  `clickhouse-01` dies before `-02` fetched a part, that batch is gone if
+  the disk is. Use `insert_quorum = 2` when acknowledged data must never be
+  lost; for traces, it rarely pays.
 
 ## Lab (25 min)
 
@@ -601,39 +682,12 @@ own state.
 
 ## Check yourself
 
-<details><summary>Does the data go through Keeper during replication?</summary>
-
-No. Keeper holds the log entry "part X exists on replica A"; replica B
-downloads the part from replica A directly (the interserver HTTP port, 9009).
-</details>
-
 <details><summary>Why does the gateway batch spans instead of inserting each one as it arrives?</summary>
 
 Every insert creates a new part. One span per insert would create parts far
 faster than merges can combine them, slowing queries and finally triggering
 "too many parts" errors. Batching (1000 spans or 5 seconds) turns many spans
 into one part.
-</details>
-
-<details><summary>A query filters on <code>TraceId</code> only. Can the primary index help?</summary>
-
-No. `TraceId` isn't in the sorting key, so the marks say nothing about
-where a trace id might be, and ClickHouse would have to read every granule.
-Module 9 covers the bloom filter index and the lookup table that fix this.
-</details>
-
-<details><summary>Why would partitioning by <code>ServiceName</code> be a bad idea?</summary>
-
-Parts never merge across partitions, so many services times many days means
-many small parts, slower merges and "too many parts" errors. Partition by
-time, for retention; put the service in the sorting key, for speed.
-</details>
-
-<details><summary>Why run 3 Keepers in production, not 2?</summary>
-
-Raft needs a majority. With 2 nodes, the majority is 2, so losing either one
-stops the cluster, which is no better than having 1. With 3, the majority is
-2, so the cluster survives one failure.
 </details>
 
 <details><summary>Keeper is down. Can you still run dashboards on the spans?</summary>
@@ -649,12 +703,12 @@ and ignore an identical block. This only works if the retried batch is
 byte-for-byte the same.
 </details>
 
-<details><summary>You count rows in <code>trace_entry</code> and get a few more than there are requests. Why, and how do you get one row per request?</summary>
+<details><summary>Keeper is down for 8 minutes. Using the gateway's retry settings from module 4, which spans are lost?</summary>
 
-A request can add two rows: its root span and an API server span that
-carries the same request id. `ReplacingMergeTree` only collapses them, keeping
-the root, when a background merge runs. Query with `FINAL` to do that merge at
-read time: then it's one row per request, led by its root span.
+Each failed batch is retried for up to 300 seconds, then dropped. Batches
+from roughly the first 3 minutes of the outage run out of retry time before
+Keeper returns and are lost; later batches are still retrying and get
+written. (If the gateway's queue fills first, it drops even more.)
 </details>
 
 <details><summary>A span was written at 00:05 on Monday. Roughly when is it deleted?</summary>
