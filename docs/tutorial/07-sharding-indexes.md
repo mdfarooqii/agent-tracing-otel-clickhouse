@@ -126,6 +126,11 @@ Adding an index to an existing table only affects new parts until you run
    Code: 507. DB::Exception: Sharding key is not deterministic. (UNABLE_TO_SKIP_UNUSED_SHARDS)
    ```
 
+   `any(TraceId)` is ClickHouse's "give me some value from the group, I don't
+   care which": a cheap way to pick one trace to look at. Don't confuse it
+   with OTLP's `AnyValue`, the protobuf type that lets an attribute value be a
+   string, number, boolean, list or map.
+
    Clean up: `DROP DATABASE lab ON CLUSTER lab_2shards SYNC`.
 
 2. **See the trace-id bloom filter skip granules:**

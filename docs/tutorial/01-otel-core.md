@@ -55,6 +55,28 @@ The **resource** describes *who produced* the spans: `service.name`,
 and `org.service`. It's set once per process and attached to every span the
 process exports. Rule of thumb: **resource = who, attributes = what**.
 
+### Labels
+
+"Labels" is this repo's word for the ownership and context attributes in the
+`org.*` namespace. Which kind a label is depends on where it lives:
+
+| Kind | Lives on | Describes | Examples | Set by |
+|---|---|---|---|---|
+| Resource label | The resource, once per process | Who sent the span, and where it runs | `org.owner`, `org.service`; `org.env`, `org.region` | The service; the gateway stamps the platform ones |
+| Span label | Each span | This particular request | `org.tenant`, `org.request_id`, `org.agent.interface` | The service, per request, often copied from baggage |
+
+Where a label lives matters. The gateway drops spans whose **resource** lacks
+`org.owner` and `org.service`, so a service that puts them on its spans
+instead (like `legacy-hr-api`) is dropped (see module 4).
+
+### Spans from non-agentic services
+
+An HTTP API, a database or a batch job with no LLM joins the agent's trace the
+same way: it **continues the trace id** it receives in `traceparent`. There is
+no merge step. If the service extracts the context, its server span gets the
+caller's trace id, with the caller's client span as its parent. Module 8 lists
+everything that has to hold for that to work.
+
 ### The SDK pipeline
 
 ```text

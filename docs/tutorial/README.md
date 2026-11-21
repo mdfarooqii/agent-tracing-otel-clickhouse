@@ -34,20 +34,20 @@ docker exec -it clickhouse-01 clickhouse-client --password demo
 Some labs need the API ports to themselves. Pause and resume the background
 traffic with `./stack.sh traffic off` and `./stack.sh traffic on`.
 
-## The plan (about 4 h 55 min)
+## The plan (about 5 hours)
 
 | # | Module | Time | You will be able to explain |
 |---|---|---|---|
 | 0 | [Setup and the mental model](00-setup.md) | 15 min | The path of one span from Python to a ClickHouse row |
 | 1 | [OpenTelemetry core](01-otel-core.md) | 40 min | Trace, span, context, propagation, resource, SDK pipeline |
 | 2 | [LangChain, LangGraph and callbacks](02-langgraph.md) | 35 min | How a graph run becomes a span tree |
-| 3 | [GenAI semantic conventions](03-genai-semconv.md) | 30 min | Which `gen_ai.*` attributes go on which span, and why |
+| 3 | [GenAI semantic conventions](03-genai-semconv.md) | 35 min | Which `gen_ai.*` attributes go on which span; sessions, turns and evals |
 | 4 | [The Collector as a gateway](04-collector.md) | 40 min | Receivers, processors, exporters, buffering and retries |
 | 5 | [Head and tail sampling](05-sampling.md) | 30 min | Where a keep/drop decision is made and what it costs |
 | 6 | [ClickHouse storage, replicas and Keeper](06-clickhouse.md) | 45 min | Parts, partitions, replication, what fails and how |
 | 7 | [Sharding, trace locality and indexes](07-sharding-indexes.md) | 25 min | Why all spans of a trace land on one shard; skip indexes |
-| 8 | [Traces across environments](08-cross-environment.md) | 20 min | Joining one trace across networks, gateways and teams |
-| 9 | [Explain-it-back cheat sheet](09-cheat-sheet.md) | 15 min | The whole system in five minutes, from memory |
+| 8 | [Joining services and environments](08-cross-environment.md) | 25 min | How non-agentic services and other environments join one trace |
+| 9 | [Explain-it-back cheat sheet and glossary](09-cheat-sheet.md) | 10 min | The whole system in five minutes, from memory |
 
 Suggested breaks: after module 3 (10 min) and after module 6 (10 min).
 

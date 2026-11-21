@@ -1,4 +1,4 @@
-# Module 3: GenAI semantic conventions (30 min)
+# Module 3: GenAI semantic conventions (35 min)
 
 ## Idea
 
@@ -52,6 +52,35 @@ operation names: `chat`, `generate_content`, `text_completion`, `embeddings`,
 Tokens live on **`chat` spans only**. To get an agent's or a turn's total,
 sum the chat spans below it; never copy totals onto parent spans, or you'll
 count them twice.
+
+### Sessions, turns and evals
+
+These three sit above individual spans:
+
+```text
+Session / conversation   gen_ai.conversation.id = c-42      many turns, minutes to days
+├── Turn 1   one trace, root span agent_turn
+├── Turn 2   another trace
+└── Turn 3   another trace
+    Evals: scores attached later to a turn or a chat span ("was this answer good?")
+```
+
+- **Turn**: one user message and the agent's full response. Here, **one turn
+  is one trace**, rooted at `agent_turn`. A turn has a clear start and end, so
+  it can be timed, sampled and debugged as a unit.
+- **Session (conversation)**: a series of turns with one user. It is **not**
+  one giant trace; a trace lasting hours can't be sampled or displayed
+  sensibly. Instead, every turn carries the same `gen_ai.conversation.id`, and
+  a session view is a query (lab step 4). Langfuse's "Sessions" screen is the
+  same idea.
+- **Evals**: scores of *quality*, not performance: was the answer correct,
+  grounded, safe, helpful? They're usually produced *after* the turn, by an
+  LLM judge, a rule, or a user's thumbs-up, and attached to the span they
+  judge by its trace id and span id. The conventions define
+  `gen_ai.evaluation.name`, `gen_ai.evaluation.score.value`,
+  `gen_ai.evaluation.score.label` and `gen_ai.evaluation.explanation`. This
+  repo doesn't produce evals yet; adding them would mean a job that reads
+  finished turns, scores them, and writes rows keyed by `TraceId`.
 
 ### Content is opt-in
 
@@ -131,6 +160,18 @@ the schema version.
    GROUP BY ServiceName, TraceId ORDER BY tokens DESC LIMIT 5;
    ```
 
+4. One session, turn by turn (each turn is its own trace):
+
+   ```sql
+   WITH (SELECT any(gen_ai_conversation_id) FROM otel.otel_traces
+         WHERE ServiceName = 'support-agent' AND gen_ai_conversation_id != '') AS conversation
+   SELECT TraceId, min(Timestamp) AS started, round(max(Duration) / 1e6) AS turn_ms,
+          max(StatusCode = 'Error') AS failed
+   FROM otel.otel_traces
+   WHERE gen_ai_conversation_id = conversation
+   GROUP BY TraceId ORDER BY started;
+   ```
+
 ## Explain it back
 
 > "The GenAI semantic conventions are OpenTelemetry's shared names for AI
@@ -143,6 +184,21 @@ the schema version.
 > schema version and keep our own labels in an `org` namespace."
 
 ## Check yourself
+
+<details><summary>Why is a session not one long trace?</summary>
+
+A session can last hours or days. A trace that long never "finishes", so it
+can't be tail sampled, its duration means nothing, and a viewer can't show it.
+Make each turn a trace, and link the turns through `gen_ai.conversation.id`.
+</details>
+
+<details><summary>An LLM judge scores an answer an hour after the turn. How does the score find its trace?</summary>
+
+The judge reads the finished turn, so it knows the trace id and the span id
+of the turn or chat span. It records the result with `gen_ai.evaluation.*`
+attributes, keyed by those ids. A query can then join scores to traces on
+`TraceId`.
+</details>
 
 <details><summary>Why put tokens on chat spans, and not on the agent span too?</summary>
 

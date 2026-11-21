@@ -1,4 +1,4 @@
-# Module 9: Explain-it-back cheat sheet (15 min)
+# Module 9: Explain-it-back cheat sheet and glossary (10 min)
 
 Close the other modules. Explain each section out loud in about a minute, then
 check yourself against the text. If you stumble, go back to that module's
@@ -32,6 +32,28 @@ check yourself against the text. If you stumble, go back to that module's
 | Head and tail sampling | Decide at the start (cheap, blind), or after the trace ends (smart, costly, one instance per trace) |
 | ClickHouse storage | Insert creates a part, parts merge; sparse index on `ORDER BY`; partitions for retention |
 | Replication and sharding | Replicas are copies (Keeper holds metadata); shards are slices (hash the trace id) |
+
+## Glossary
+
+| Term | Meaning | Module |
+|---|---|---|
+| Span | One timed operation: name, start and end, status, kind, attributes | [1](01-otel-core.md) |
+| Trace id | 32 hex characters shared by every span of one request, across services | [1](01-otel-core.md) |
+| Parent span id | The span that caused this one; turns a flat list into a tree. Empty on the root | [1](01-otel-core.md) |
+| Root span | The span with no parent; here `agent_turn` | [1](01-otel-core.md) |
+| Span kind | `INTERNAL`, `CLIENT`, `SERVER`, `PRODUCER`, `CONSUMER`; a client/server pair is a service edge | [1](01-otel-core.md) |
+| `traceparent` | W3C header carrying trace id, parent span id and the sampled flag | [1](01-otel-core.md) |
+| Baggage | Request-wide key/values in the `baggage` header; copied onto spans only if a service chooses to | [1](01-otel-core.md) |
+| Resource | Who sent the span: `service.name`, `org.owner`, `org.service` | [1](01-otel-core.md) |
+| Labels | This repo's `org.*` attributes: resource labels (who and where) and span labels (this request) | [1](01-otel-core.md) |
+| Semconv | OpenTelemetry's shared names for spans and attributes, versioned by schema URL | [3](03-genai-semconv.md) |
+| `gen_ai.*` | The GenAI part of semconv: operation, agent, model, provider, tool, tokens, conversation | [3](03-genai-semconv.md) |
+| Turn | One user message and the agent's response; one trace | [3](03-genai-semconv.md) |
+| Session | A conversation of many turns, linked by `gen_ai.conversation.id`; not one trace | [3](03-genai-semconv.md) |
+| Eval | A quality score for a turn or span, usually added later, using `gen_ai.evaluation.*` | [3](03-genai-semconv.md) |
+| Span link | A pointer to a span in another trace, for async, batch or trust-boundary cases | [8](08-cross-environment.md) |
+| Non-agentic service | Any callee without an LLM; it joins the trace by continuing the trace id it receives | [8](08-cross-environment.md) |
+| `any(x)` | ClickHouse aggregate: some value of `x` from the group (not OTLP's `AnyValue` type) | [7](07-sharding-indexes.md) |
 
 ## Memory hooks
 

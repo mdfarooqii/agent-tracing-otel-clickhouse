@@ -1,10 +1,42 @@
-# Module 8: Traces across environments (20 min)
+# Module 8: Joining services and environments into one trace (25 min)
 
 ## Idea
 
+### First: joining spans from non-agentic services
+
+An HTTP API, a database client or a batch job with no LLM joins an agent's
+trace the same way any service does. **There is no merge step**: a service's
+spans are part of the trace if they carry the same trace id, with a parent id
+pointing at the caller's span. In this repo, `kb-search-api`, `ticket-api` and
+`pricing-api` are such services. Five things have to hold:
+
+| # | Condition | In this repo | If it doesn't hold |
+|---|---|---|---|
+| 1 | The caller **injects** context into the request | `propagate.inject(headers)` in `call_api` writes `traceparent` and `baggage` | The callee starts a new, unrelated trace |
+| 2 | The service **extracts** it and starts its server span from it | `propagate.extract(...)` in `apis.py` | Same: a new trace per request |
+| 3 | Every hop in between **forwards the headers** | Direct calls on localhost | Separate traces (`STRIP_TRACE_HEADERS=1`, lab step 3) |
+| 4 | The service's spans **reach the same store** and pass its rules | Gateway requires `org.owner` and `org.service` on the resource | Only the caller's client span appears (`legacy-hr-api`, lab step 4) |
+| 5 | The service samples **parent-based** | The SDK default | Orphan spans, or missing halves (module 5) |
+
+For a real service you rarely write conditions 1 and 2 yourself.
+**Auto-instrumentation** does it for common frameworks and clients:
+`opentelemetry-instrument python app.py` with the Flask, FastAPI or requests
+instrumentation packages in Python; the Java agent jar; or
+`@opentelemetry/auto-instrumentations-node` for Node.
+
+Some callees can't be instrumented at all: a database, a SaaS API, a legacy
+system. You still get the caller's **client span**, with its duration, status
+and error, but nothing inside the callee. `INSERT tickets` from `ticket-api`
+to Postgres is such a span here. Beyond that, the fallback is correlating on a
+business id the callee logs (such as `org.request_id`), which is a workaround,
+not a trace.
+
+### Across environments
+
 An agent runs in one environment (a cluster, a cloud account, a region), and
 the services it calls run in another. You want **one trace** showing both.
-That needs four things to hold, and each one fails in its own way.
+Everything above still applies, and four more things have to hold, each of
+which fails in its own way.
 
 | # | Requirement | Typical way it breaks | Fix |
 |---|---|---|---|
@@ -145,6 +177,34 @@ Pause the background traffic first: `./stack.sh traffic off`.
 
    Then `cd .. && ./stack.sh traffic on`.
 
+4. **Find callees that never joined the trace.** List every outgoing call and
+   how often it has no server span under it:
+
+   ```sql
+   SELECT c.ServiceName AS caller, c.SpanName, count() AS calls, countIf(s.SpanId = '') AS no_server_span
+   FROM otel.otel_traces AS c
+   LEFT JOIN (SELECT TraceId, SpanId, ParentSpanId FROM otel.otel_traces WHERE SpanKind = 'Server') AS s
+     ON s.TraceId = c.TraceId AND s.ParentSpanId = c.SpanId
+   WHERE c.SpanKind = 'Client' AND c.SpanName NOT LIKE 'chat%' AND c.Timestamp > now() - INTERVAL 1 HOUR
+   GROUP BY caller, c.SpanName ORDER BY caller;
+   ```
+
+   ```text
+   hr-agent     GET /employees/{employee_id}   459   459
+   hr-agent     POST /v1/tickets               459     3
+   sales-agent  GET /v1/prices/{sku}          1163     8
+   support-agent GET /v1/search                477     3
+   ticket-api   INSERT tickets                 460   460
+   ```
+
+   Read it row by row:
+   - `GET /employees/...`: **always** missing. `legacy-hr-api` sends spans, but
+     the gateway drops them (condition 4).
+   - `INSERT tickets`: always missing, and that's expected. It's a database
+     call, and Postgres doesn't emit spans; the client span is all you get.
+   - The few misses on the other routes are the stripped-headers runs from
+     step 3 (condition 3).
+
 ## Explain it back
 
 > "To see one trace across environments, the W3C trace headers have to survive
@@ -157,6 +217,23 @@ Pause the background traffic first: `./stack.sh traffic off`.
 > unrelated traces, and the only way back is correlating on a business id."
 
 ## Check yourself
+
+<details><summary>A plain REST service with no LLM is called by an agent. What does it need to show up inside the agent's trace?</summary>
+
+It has to extract `traceparent` from incoming requests and start its server
+span from that context; auto-instrumentation does this for common frameworks.
+It also needs the resource labels the gateway requires, an exporter pointing
+at the gateway, and parent-based sampling. Nothing is merged afterwards: the
+shared trace id makes it part of the trace.
+</details>
+
+<details><summary>An agent's client span has no server span under it. What are the possible causes?</summary>
+
+The callee isn't instrumented (a database, a SaaS API). Or it's instrumented
+but didn't receive or extract the headers. Or its spans were dropped on the
+way, by the gateway's filter or by a sampler. Or they went to a different
+backend.
+</details>
 
 <details><summary>Spans from both environments are in the same table, but the trace shows as two. Why?</summary>
 
