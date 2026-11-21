@@ -1,4 +1,4 @@
-# Module 9: Sharding, trace locality and indexes (35 min)
+# Module 9: Sharding, trace locality and indexes (38 min)
 
 ## Why this matters
 
@@ -32,8 +32,7 @@ background job that rewrites existing parts ([module 8](08-data-model.md)).
 | Shard | A **slice** of the data. Each shard holds different rows |
 | Local table | The ordinary table on each server that actually stores that shard's rows |
 | `Distributed` table | A table that stores nothing. It forwards inserts to shards and collects query results from them |
-| Sharding key | An expression computed for each row that decides which shard it goes to |
-| Hash function | A function that turns a value (like a trace id) into a number. Same input, same number, every time |
+| Sharding key | An expression computed for each row that decides which shard it goes to, usually a hash (a function that turns a value into a number; same input, same number) |
 | Trace locality | All spans of one trace stored on the same shard |
 | Hot shard | One shard getting much more data or traffic than the others |
 | Skip index | An extra index that stores a small summary per block of granules, so ClickHouse can skip blocks that can't match |
@@ -76,14 +75,18 @@ Both: a typical production cluster (3 shards x 2 replicas = 6 servers)
   replica b    [ slice 1 ]    [ slice 2 ]    [ slice 3 ]
 ```
 
-A real cluster usually has both: shards for size, and replicas of each
-shard for safety.
-
 Both clusters are defined in `clickhouse/cluster.xml`. `tracing` has one
 `<shard>` with two `<replica>` entries. `lab_2shards` has two `<shard>`
 entries with one `<replica>` each, pointing at the same two servers. That
 works because a cluster definition is only a list of addresses; the lab
 creates separate tables for it.
+
+> **Quick check:** In the 3 x 2 cluster above, one server in shard 2 dies. Can you still read every trace?
+>
+> <details><summary>Answer</summary>
+>
+> Yes. Shard 2's other replica holds the same slice. Lose both servers of shard 2, though, and about a third of all traces are gone, because no other shard has them.
+> </details>
 
 ### The Distributed table
 
@@ -117,15 +120,10 @@ CREATE TABLE lab.spans_by_trace AS lab.spans_by_trace_local
 ENGINE = Distributed(lab_2shards, lab, spans_by_trace_local, cityHash64(TraceId));
 ```
 
-Reading it piece by piece:
-
-- `AS lab.spans_by_trace_local`: copy the column list from the local table.
-- `Distributed(`: the router engine. Its four arguments are:
-  - `lab_2shards`: the cluster, which lists the shards.
-  - `lab`: the database of the local table on each shard.
-  - `spans_by_trace_local`: the local table that really stores the rows.
-  - `cityHash64(TraceId)`: the sharding key. `cityHash64` is a fast hash
-    function that turns the trace id string into a 64-bit number.
+`AS` copies the column list from the local table. The four `Distributed`
+arguments are the cluster (which lists the shards), the database and name
+of the local table on each shard, and the sharding key: `cityHash64`, a
+fast hash that turns the trace id into a 64-bit number.
 
 Two details you'll meet in the lab and config:
 
@@ -142,6 +140,13 @@ Two details you'll meet in the lab and config:
 shard, so there's nothing to route between. The gateway writes straight
 into `otel_traces`, and replication copies it. The comment at the top of
 `clickhouse/schema.sql` says the same.
+
+> **Quick check:** A `Distributed` insert without `distributed_foreground_insert` returns OK, and a count straight after is a little low. Were rows lost?
+>
+> <details><summary>Answer</summary>
+>
+> Probably not. The insert returned once the rows were queued on the server you wrote to; they reach the shards a moment later. Count again. Rows are only at risk if that queue can't drain, for example while a shard is down.
+> </details>
 
 ### Why `cityHash64(TraceId)` keeps a trace together
 
@@ -184,9 +189,17 @@ start with enough shards, or give a new shard a higher weight so that new
 data fills it while old data ages out with the TTL.
 
 **A production variant.** Instead of inserting through a `Distributed`
-table, a gateway tier can route by trace id itself (the `loadbalancing`
-exporter, from module 5) and write straight to each shard's local table.
-The principle is the same: **shard by trace id**.
+table, a gateway tier can route by trace id itself and write straight to
+each shard's local table. Remember from [module 5](05-sampling.md): the
+`loadbalancing` exporter already routes by trace id so tail sampling sees
+whole traces. The principle is the same: **shard by trace id**.
+
+> **Quick check:** You go from 4 shards to 5 by changing the cluster config only. What happens to `WHERE TraceId = '...'` with `optimize_skip_unused_shards = 1` for last week's traces?
+>
+> <details><summary>Answer</summary>
+>
+> About four in five return nothing: the new modulo points them at a different shard than the one they were written to. Without the setting the query asks all shards and still works, just slower.
+> </details>
 
 ### Indexes you can add
 
@@ -292,20 +305,20 @@ in a few blocks and absent from the rest.
   of `WHERE org_tenant = ...` still read 8 of 11 granules. When nothing can
   be ruled out, the index just costs time.
 
-The agent name sits in between, which lab step 3 shows. Each agent runs in
-one service (`quoter` only in `sales-agent`), and the service is the second
-column of the sorting key, so in large merged parts an agent's rows sit
-together and a `set` index can skip the other services' blocks. But that's
-the sorting key doing the work: adding `org_service = 'sales-agent'` to the
-filter gets the same skipping from the primary index, for free. And in the
-small, fresh parts that each insert creates, every granule holds a mix of
-all services and agents, so there the index skips nothing. Always check with
+The agent name sits in between; lab step 3 measures it. Always check with
 `EXPLAIN indexes = 1` that an index actually skips something.
 
 **Adding an index to an existing table** only affects parts written after
 that. To build it for old parts, run `MATERIALIZE INDEX`, which starts a
-**mutation**: a background job that rewrites the existing parts with the new
-index. You can follow it in `system.mutations`.
+mutation (remember from module 8: a background rewrite of existing parts).
+You can follow it in `system.mutations`.
+
+> **Quick check:** Would a `minmax` index on `TraceId` help trace lookups?
+>
+> <details><summary>Answer</summary>
+>
+> No. Trace ids are random and not in the sorting key, so every granule's min and max span nearly the whole range of ids and nothing can be ruled out. Rare, unclustered values need a bloom filter.
+> </details>
 
 ## Remember it
 
@@ -325,6 +338,53 @@ index. You can follow it in `system.mutations`.
   tables (one shard); the `INDEX` lines on `otel_traces` (bloom filters and a
   `minmax`); the `otel_traces_trace_id_ts` lookup table.
 - `docs/tutorial/labs/sharding.sql`: the two-shard experiment.
+
+## Principal engineer's notes
+
+**Touch points**
+- Gateway to ClickHouse (touch point 3 in [module 0](00-setup.md)) is where
+  the sharding decision lives. Either the gateway writes to a `Distributed`
+  table (simple, ClickHouse owns routing) or it routes by trace id and writes
+  to local tables (the platform team owns routing). Pick one owner; if both
+  route with different hashes, traces split.
+- The shard count is a contract with every reader that sets
+  `optimize_skip_unused_shards`. Change it, and their lookups silently miss.
+
+**At scale**
+- Don't shard early. One well-sized ClickHouse server can ingest well over
+  a hundred thousand spans per second in large batches (it depends on span
+  size) and hold tens of terabytes compressed.
+  Shard when write throughput or disk outgrows the biggest node you'd run,
+  not before: each shard adds servers, replicas and fan-out cost.
+- A query on a `Distributed` table is as slow as its **slowest shard**. One
+  shard with a long merge backlog or a cold disk slows every fan-out query.
+  Trace lookups that hit one shard dodge this; dashboards don't.
+- Plan headroom: size shards to stay under ~50-60% disk at full retention, so
+  you can grow by adding replicas or bigger disks for a year before
+  resharding.
+
+**Operational issues**
+- **Skew.** Hashing `TraceId` spreads traces evenly, but one huge trace still
+  lands on one shard. Sharding by tenant instead would put a hot tenant on
+  one shard. Compare `count()` per `shardNum()` regularly.
+- **Background `Distributed` inserts** queue on the receiving server's disk
+  when a shard is down. The queue grows, then floods the shard when it comes
+  back. Writing to local tables from the gateway avoids this queue; the
+  gateway's own retry queue takes its place.
+- **Resharding** means copying data ([module 10](10-copying-data.md)) or
+  waiting out the TTL with weights. With a 72-hour TTL, waiting is cheap;
+  with 13 months of retention, it isn't.
+
+**Design trade-offs**
+- **Skip indexes cost insert CPU and disk.** Here the nine indexes on
+  `otel_traces` take about 57 KiB against 2.4 MiB of column data (roughly
+  2%); `system.data_skipping_indices` shows the sizes. Every insert builds
+  them. Keep one only if `EXPLAIN indexes = 1` shows it skipping granules on
+  a query people actually run. The tenant index here is tiny but barely
+  skips anything, so it earns its keep only if tenants become clustered.
+- **Trace locality vs even spread.** This repo would choose `TraceId`. Choose
+  a coarser key (tenant, conversation) only if most queries filter on it and
+  you can live with skew.
 
 ## Lab (20 min)
 
@@ -386,11 +446,7 @@ index. You can follow it in `system.mutations`.
 
    "Not deterministic" means the key doesn't give the same answer for the
    same input: `rand()` can't tell ClickHouse which shard holds a trace.
-
-   `any(TraceId)` is ClickHouse's "give me some value from the group, I don't
-   care which": a cheap way to pick one trace to look at. Don't confuse it
-   with OTLP's `AnyValue`, the protobuf type that lets an attribute value be a
-   string, number, boolean, list or map.
+   (`any(TraceId)` just picks some trace id, a cheap way to choose one.)
 
    Clean up the four lab tables:
 
@@ -482,11 +538,10 @@ index. You can follow it in `system.mutations`.
 - A `Distributed` table stores nothing: it routes inserts by the sharding
   key and merges query results from all shards.
 - Sharding by a hash of the trace id keeps each trace on one shard, spreads
-  load evenly, and lets a trace lookup ask just one shard.
-- This repo has one shard, so it has no `Distributed` tables; the lab uses
-  `lab_2shards` to show the idea.
-- The shard is the hash modulo the shard count, so changing the count later
-  reroutes most rows. Plan the shard count up front.
+  load evenly, and lets a trace lookup ask just one shard. This repo has one
+  shard, so no `Distributed` tables; the lab uses `lab_2shards`.
+- Changing the shard count later reroutes most rows. Shard late, but plan
+  the count up front.
 - The sorting key is the only physical order. For other filters, use skip
   indexes (`bloom_filter` for rare values like ids, `minmax` and `set` for
   values clustered by the sort order), projections, or a lookup table.
@@ -501,6 +556,14 @@ index. You can follow it in `system.mutations`.
 
 No. A replica is a full copy, so each server still stores everything. To
 store more, add shards.
+</details>
+
+<details><summary>Mixing module 5: your gateways tail-sample behind a <code>loadbalancing</code> exporter and write to a sharded cluster. Why do both layers route by trace id?</summary>
+
+For the same reason at different stages. The sampler must see every span of
+a trace to decide on the whole trace; the database must keep every span of a
+trace on one shard so a lookup asks one shard. Routing by anything else
+splits traces in one layer or the other.
 </details>
 
 <details><summary>Why not shard by service name?</summary>
@@ -539,14 +602,6 @@ trace ids map to a different shard than before, but their old rows stay
 where they were written. Lookups that skip unused shards would then ask the
 wrong one. You either copy the data again into the new layout, or weight the
 new shard so new data fills it while old data expires.
-</details>
-
-<details><summary>Would a <code>set</code> index on <code>org_tenant</code> help <code>WHERE org_tenant = ...</code>?</summary>
-
-Hardly. Tenants are picked at random per turn, so every tenant appears in
-most granules, and there's little to rule out. The existing bloom filter
-still read 8 of 11 granules in a test run. Indexes need rare or clustered
-values.
 </details>
 
 ## Next

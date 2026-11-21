@@ -178,6 +178,9 @@ Every module has the same shape:
 - **In this repo**: where the concept lives in the code.
 - **Lab**: commands to run, with the output you should see.
 - **Explain it back**: a 30-second script to say out loud.
+- **Quick checks**: short questions right after each big idea, answers hidden.
+- **Principal engineer's notes**: touch points, scale, operational issues and
+  design trade-offs, for readers who will run this in production.
 - **Recap**: the main points in a few bullets.
 - **Check yourself**: questions; answers are hidden under each one.
 - **Next**: what the next module answers, and why it comes next.
@@ -207,35 +210,36 @@ You'll write SQL in one of two places:
 Some labs need the API ports (18081 to 18084) to themselves. Pause and resume
 the background traffic with `./stack.sh traffic off` and `./stack.sh traffic on`.
 
-## The plan (two sessions, about 9 hours in total)
+## The plan (two sessions, about 11 hours in total)
 
 The course comes in two parts. Part 1 follows a span from the agent to the
 gateway; part 2 follows it into ClickHouse and covers running it in
-production. Each part is a comfortable day, or two half-days.
+production. Each part is a full day, or two half-days. Module 6 ends part 1 with a
+mixed review of modules 0 to 6.
 
-### Part 1: making and shipping spans (about 5 hours 15 minutes)
-
-| # | Module | Time | You will be able to explain |
-|---|---|---|---|
-| 0 | [Setup and the mental model](00-setup.md) | 25 min | What each component does, and the path of one question from Python to a ClickHouse row |
-| 1 | [OpenTelemetry core](01-otel-core.md) | 50 min | Trace, span, context, propagation, baggage, resource, SDK pipeline, OTLP |
-| 2 | [LangChain, LangGraph and callbacks](02-langgraph.md) | 50 min | How a graph run becomes a span tree |
-| 3 | [GenAI semantic conventions](03-genai-semconv.md) | 50 min | Which `gen_ai.*` attributes go on which span; sessions, turns and evals |
-| 4 | [The Collector as a gateway](04-collector.md) | 50 min | Receivers, processors, exporters, buffering, retries, and where data can be lost |
-| 5 | [Head and tail sampling](05-sampling.md) | 60 min | Where a keep/drop decision is made and what it costs |
-| 6 | [Joining services and environments](06-cross-environment.md) | 30 min | The checklist for one trace across services and environments, and what breaks it |
-
-### Part 2: storing and running it (about 4 hours 10 minutes)
+### Part 1: making and shipping spans (about 6 hours)
 
 | # | Module | Time | You will be able to explain |
 |---|---|---|---|
-| 7 | [ClickHouse storage, replicas and Keeper](07-clickhouse.md) | 40 min | Parts, partitions, the sorting key, replication, what fails and how |
-| 8 | [The data model](08-data-model.md) | 35 min | Every column and table in `schema.sql`, and which summary table answers which question |
-| 9 | [Sharding, trace locality and indexes](09-sharding-indexes.md) | 35 min | Why all spans of a trace land on one shard; skip indexes |
-| 10 | [Adding a replica and copying data](10-copying-data.md) | 35 min | A third replica, `remote()`, FETCH/ATTACH PARTITION, safe incremental copies |
-| 11 | [Moving older data to S3](11-s3-tiering.md) | 40 min | Disks, storage policies and TTL moves; local S3 with SeaweedFS; real S3 settings |
-| 12 | [Operational readiness, gateway to ClickHouse](12-operations.md) | 45 min | The signals to watch, reading the health check, and a production checklist |
-| 13 | [Cheat sheet and glossary](13-cheat-sheet.md) | 20 min | The whole system in five minutes, from memory |
+| 0 | [Setup and the mental model](00-setup.md) | 30 min | What each component does, and the path of one question from Python to a ClickHouse row |
+| 1 | [OpenTelemetry core](01-otel-core.md) | 55 min | Trace, span, context, propagation, baggage, resource, SDK pipeline, OTLP |
+| 2 | [LangChain, LangGraph and callbacks](02-langgraph.md) | 55 min | How a graph run becomes a span tree |
+| 3 | [GenAI semantic conventions](03-genai-semconv.md) | 55 min | Which `gen_ai.*` attributes go on which span; sessions, turns and evals |
+| 4 | [The Collector as a gateway](04-collector.md) | 55 min | Receivers, processors, exporters, buffering, retries, and where data can be lost |
+| 5 | [Head and tail sampling](05-sampling.md) | 65 min | Where a keep/drop decision is made and what it costs |
+| 6 | [Joining services and environments](06-cross-environment.md) | 45 min | The checklist for one trace across services and environments, and what breaks it |
+
+### Part 2: storing and running it (about 5 hours)
+
+| # | Module | Time | You will be able to explain |
+|---|---|---|---|
+| 7 | [ClickHouse storage, replicas and Keeper](07-clickhouse.md) | 45 min | Parts, partitions, the sorting key, replication, what fails and how |
+| 8 | [The data model](08-data-model.md) | 40 min | Every column and table in `schema.sql`, and which summary table answers which question |
+| 9 | [Sharding, trace locality and indexes](09-sharding-indexes.md) | 38 min | Why all spans of a trace land on one shard; skip indexes |
+| 10 | [Adding a replica and copying data](10-copying-data.md) | 38 min | A third replica, `remote()`, FETCH/ATTACH PARTITION, safe incremental copies |
+| 11 | [Moving older data to S3](11-s3-tiering.md) | 45 min | Disks, storage policies and TTL moves; local S3 with SeaweedFS; real S3 settings |
+| 12 | [Operational readiness, gateway to ClickHouse](12-operations.md) | 50 min | The signals to watch, reading the health check, and a production checklist |
+| 13 | [Cheat sheet and glossary](13-cheat-sheet.md) | 40 min | The whole system in five minutes, from memory |
 | A | [Metrics reference](appendix-metrics-reference.md) | reference | Every metric per component: what it means, a bad value, what to do |
 
 Suggested breaks: after modules 2 and 4 in part 1, and after modules 8 and 10

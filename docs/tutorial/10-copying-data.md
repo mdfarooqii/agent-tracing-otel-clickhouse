@@ -1,4 +1,4 @@
-# Module 10: Adding a replica and copying data between ClickHouse servers (35 min)
+# Module 10: Adding a replica and copying data between ClickHouse servers (38 min)
 
 ## Why this matters
 
@@ -54,19 +54,34 @@ copy rows over the network.
 | Snapshot and restore | `BACKUP TABLE ... TO Disk(...)` or `S3(...)`; `RESTORE` | No |
 | Turn a single-node `MergeTree` into `ReplicatedMergeTree` | Create a replicated table and `ATTACH PARTITION FROM` the old one; or put a `convert_to_replicated` flag file in the table's data directory and restart | Yes, afterwards |
 
+> **Quick check:** A test team wants yesterday's spans on their own laptop ClickHouse. Which row of the table?
+>
+> <details><summary>Answer</summary>
+>
+> A one-off `remote()` copy with a `WHERE` on yesterday's date. The laptop shares no Keeper, and making it a replica would pull every part of every table and add it to production's replica set.
+> </details>
+
 ### Adding a replica
 
 A replicated table is identified in Keeper by its path. If a new server
 creates a table that resolves to the **same path** (here: the same UUID and
 `{shard}`), with a **new** `{replica}` name, it joins as one more replica.
 Keeper's log lists every part, so the new replica downloads all of them from
-its peers. You copy no data yourself.
+its peers. You copy no data yourself. (Remember from module 7: replicas
+download parts from each other over port 9009; Keeper holds only the list.)
 
 The `{shard}` macro decides which shard the new server joins
 ([module 9](09-sharding-indexes.md)). In a sharded cluster, you add replicas
 shard by shard: a new server with `<shard>02</shard>` becomes a copy of
 shard 2 only. Adding a replica never adds storage capacity; adding a shard
 does, but existing rows stay where they are (module 9).
+
+> **Quick check:** You create the table on the new server but copy the DDL without its UUID. What happens?
+>
+> <details><summary>Answer</summary>
+>
+> The table gets a new UUID, so `{uuid}` resolves to a new Keeper path. It becomes the first replica of a brand-new, empty table instead of joining the existing one. That's why `add-replica.sh` copies the DDL with the UUID.
+> </details>
 
 ### `remote()`: pull rows from any server
 
@@ -76,18 +91,9 @@ remote(...)` pulls every row across. `remoteSecure` does the same over TLS
 (encrypted connections). The servers share nothing but a network and a
 password.
 
-`remote()` is also useful without copying anything. [Module
-6](06-cross-environment.md) kept each environment's spans in its own
-ClickHouse and combined them at query time:
-
-```sql
-SELECT * FROM otel.otel_traces WHERE TraceId = '...'
-UNION ALL
-SELECT * FROM remote('clickhouse.env-b.internal', otel.otel_traces, 'reader', '...') WHERE TraceId = '...';
-```
-
-That reads both halves of one trace in one query, and nothing is stored
-twice.
+Remember from [module 6](06-cross-environment.md): `remote()` also works
+without copying, joining two environments' halves of a trace at query time
+with `UNION ALL`.
 
 ### Keep copying, without losing late spans
 
@@ -147,6 +153,13 @@ schedule inside ClickHouse. Or skip copying entirely: give the gateway two
 `clickhouse` exporters, one per destination, so every span is written to
 both (**dual-write**).
 
+> **Quick check:** Someone raises the gateway's `max_elapsed_time` to 30 minutes. What must change in the copy job?
+>
+> <details><summary>Answer</summary>
+>
+> The overlap. Spans can now arrive up to 30 minutes late, so a 10-minute look-back misses some. Make the window longer than the new limit plus the longest turn, for example 40 minutes.
+> </details>
+
 ### Moving partitions and snapshots
 
 - **`FETCH PARTITION` and `ATTACH PARTITION`.** `FETCH` downloads all parts
@@ -191,6 +204,47 @@ both (**dual-write**).
 - `otel-gateway-config.yaml`: `retry_on_failure`, which bounds how late a
   span can arrive.
 
+## Principal engineer's notes
+
+**Touch points**
+- Adding a replica uses touch points 4 and 5 from [module 0](00-setup.md):
+  Keeper for the part list, port 9009 for the bytes. `remote()` uses the
+  native port 9000 and a ClickHouse user, so the copy job needs a read-only
+  account on the source and a network path to it.
+- The copy contract is the **schema**. If source and target differ (a column
+  added on one side, columns reordered), `INSERT ... SELECT *` matches
+  columns by position: it fails on a count mismatch, or worse, puts values
+  in the wrong column when types happen to fit. List columns explicitly in
+  long-lived copy jobs, and change both sides in the same release.
+
+**At scale**
+- A new replica copies **everything** over the network. 5 TB at an
+  effective 1 Gbit/s is about 11 hours, while the peers spend disk and
+  network on serving it. Throttle with the table setting
+  `max_replicated_fetches_network_bandwidth` or the server-wide
+  `max_replicated_fetches_network_bandwidth_for_server` (both bytes per
+  second, 0 = unlimited), and add replicas off-peak.
+- `GLOBAL NOT IN` ships the id list across the network and holds it in
+  memory. Keep the window short (minutes, run often) rather than long and
+  rare, or switch to a `ReplacingMergeTree` target.
+
+**Operational issues**
+- **Backups are not replicas.** A bad `ALTER ... DELETE` or a dropped table
+  replicates instantly to every copy. Only `BACKUP ... TO S3(...)` protects
+  against that. Restore into a scratch database on a schedule; a backup
+  never restored is a hope, not a backup.
+- **Idempotency.** Every copy job must survive being run twice or killed
+  halfway. Overlap plus dedup gives that; a watermark kept outside the data
+  (a file, a variable) usually doesn't.
+- A replica stuck fetching shows as a growing `queue_size` in
+  `system.replicas` ([module 12](12-operations.md)).
+
+**Design trade-offs**
+- **Cross-region:** prefer dual-write from the gateway, so each
+  region gets spans on its own and a region outage loses nothing already
+  written. A scheduled `remote()` copy is simpler to add later but lags by
+  its interval. A stretched Keeper across regions is the option to avoid.
+
 ## Lab (20 min)
 
 Start the two extra servers (from the repo root). Passing two `-f` files
@@ -222,10 +276,10 @@ docker compose -f compose.yaml -f docs/tutorial/labs/compose.replication.yaml up
    clickhouse-03  35003
    ```
 
-   `3  3  0` means three replicas, all three active, and nothing left in the
-   fetch queue, and the two counts match (yours will differ). The script did nothing but create empty tables with the
-   same UUIDs. Keeper told `clickhouse-03` which parts exist, and it fetched
-   them from its peers. New spans keep arriving on all three. Writes work in
+   `3  3  0` means three replicas, all active, nothing left in the fetch
+   queue; the two counts match (yours will differ). The script only created
+   empty tables; Keeper told `clickhouse-03` which parts exist, and it
+   fetched them. New spans keep arriving on all three. Writes work in
    any direction: a row inserted on `clickhouse-03` shows up on
    `clickhouse-01`, including in `trace_entry`, via `clickhouse-03`'s own
    view.
@@ -394,10 +448,9 @@ docker compose -f compose.yaml -f docs/tutorial/labs/compose.replication.yaml up
   lateness, and deduplicate (`GLOBAL NOT IN` on `(TraceId, SpanId)`, or a
   `ReplacingMergeTree` target).
 - `SELECT *` leaves out MATERIALIZED columns; the target recomputes them.
-- Materialized views fire on direct inserts, not on fetched parts; derived
-  tables replicate on their own.
-- Drop a replica's tables before removing the server, or clean up with
-  `SYSTEM DROP REPLICA`.
+  Views fire on direct inserts, not on fetched parts.
+- Backups protect against bad deletes; replicas don't. Drop a replica's
+  tables before removing the server, or use `SYSTEM DROP REPLICA`.
 
 ## Check yourself
 
@@ -406,12 +459,6 @@ docker compose -f compose.yaml -f docs/tutorial/labs/compose.replication.yaml up
 No. `SELECT *` leaves them out, and the target table recomputes them on
 insert from its own definitions. If the target defines them differently,
 the copy follows the target's definition.
-</details>
-
-<details><summary>A new replica's materialized views didn't run for the parts it fetched. Is the derived data missing?</summary>
-
-No. The derived tables are replicated themselves, so the new replica fetches
-their parts too. Views only run on inserts the server receives directly.
 </details>
 
 <details><summary>Your hourly copy uses <code>WHERE Timestamp > (SELECT max(Timestamp) FROM target)</code>. A few <code>agent_turn</code> spans are missing in the target. Why?</summary>
@@ -439,7 +486,7 @@ region), which costs nothing at query time, or a scheduled incremental
 regions makes every insert depend on cross-region latency.
 </details>
 
-<details><summary>You add a replica to a cluster with two shards. Does it get all the data?</summary>
+<details><summary>Mixing module 9: you add a replica to a cluster with two shards. Does it get all the data?</summary>
 
 No, only its shard's. Its `{shard}` macro decides which Keeper path it
 joins, so it becomes a copy of that one shard. Each shard needs its own

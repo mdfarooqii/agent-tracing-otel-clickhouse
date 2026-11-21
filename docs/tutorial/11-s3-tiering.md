@@ -1,4 +1,4 @@
-# Module 11: Moving older data to S3 (40 min)
+# Module 11: Moving older data to S3 (45 min)
 
 ## Why this matters
 
@@ -38,21 +38,19 @@ question: where on each server should older data live?
 | **`move_factor`** | A policy setting: when a volume's free space drops below this fraction, ClickHouse starts moving parts to the next volume. |
 | **Cache disk** | A ClickHouse disk type that keeps a local copy of recently read S3 data, so repeated reads skip S3. |
 
-Reminders from earlier modules: a **part** is one folder of rows on disk, and
-every insert creates one; a **merge** combines small parts into bigger ones;
-a **partition** groups parts by a key, here one day, and parts in different
-partitions never merge ([module 7](07-clickhouse.md)). A **replica** is one of
-the two servers holding a full copy ([module 7](07-clickhouse.md)). The schema's
-72-hour delete TTL is in [module 8](08-data-model.md).
+> **Remember from [module 7](07-clickhouse.md):** every insert creates a
+> **part** (one folder of rows); **merges** combine parts; parts in different
+> **partitions** (here, days) never merge; each **replica** holds a full copy.
+> The schema's 72-hour delete TTL is in [module 8](08-data-model.md).
 
 ## Idea
 
 ### First: what is object storage, and why use it?
 
 Your laptop's disk is **block storage**: the operating system can read or
-change any byte of any file, very fast. Servers in the cloud use the same kind
-of disk (SSDs attached to the machine). It's fast, but you pay for the full
-size of the disk whether you use it or not, and it's tied to one machine.
+change any byte of any file, very fast. Cloud servers use the same kind (SSDs
+attached to the machine): fast, but you pay for the full size whether you use
+it or not, and it's tied to one machine.
 
 **Object storage** works differently. You upload a whole file under a name,
 like `traces/clickhouse-01/abc/data.bin`, and later download it by that name,
@@ -79,10 +77,8 @@ trend chart. So:
 
 **Tiered storage** does this automatically. Live data lands locally; as it
 ages, ClickHouse moves it to S3. Queries don't change: ClickHouse reads local
-and S3 parts together and returns one answer.
-
-Without it, your choices are worse: buy ever-bigger disks, or delete data
-sooner than you'd like.
+and S3 parts together and returns one answer. Without it, you buy ever-bigger
+disks or delete data sooner than you'd like.
 
 A word on the numbers. A production setup typically keeps days to a couple of
 weeks on local disk and months on S3. This lab's defaults are much shorter:
@@ -118,29 +114,33 @@ enough, or early if the local disk is almost full. Rows that are already old
 when you insert them go straight to S3 (more on that below). Later, a delete
 rule removes them entirely.
 
-### Disks, one at a time
+### The disks and volumes in this lab
 
-The lab defines two new disks next to the built-in `default` disk:
+Three disks:
 
 - **`default`**: the local filesystem (`/var/lib/clickhouse/`). Always exists.
-- **`s3`**: a bucket and prefix in S3. ClickHouse stores the real data as
-  objects in S3, and keeps only small **metadata** files on the local disk
-  that record which S3 objects make up each file.
-- **`s3_cache`**: a **cache** disk wrapped around `s3`. When ClickHouse reads
-  from S3, it keeps a copy on local disk (up to a size limit). The next read of
-  the same data comes from the cache instead of S3.
+- **`s3`**: a bucket and prefix in S3. The real data lives there as objects;
+  the local disk keeps only small **metadata** files that record which S3
+  objects make up each part file.
+- **`s3_cache`**: a **cache** disk wrapped around `s3`. Data read from S3 is
+  kept on local disk (up to a size limit), so the next read skips S3.
 
-### Volumes and the storage policy
+The `tiered` policy puts them into two volumes, in order: `default` (the local
+disk) and `cold` (`s3_cache`, which reads and writes `s3`). A table opts in
+with `SETTINGS storage_policy = 'tiered'`. Tables that don't use the built-in
+policy also called `default`: one volume, also called `default`, on the local
+disk.
 
-A **volume** is a tier: one or more disks treated as one place. A **storage
-policy** lists volumes in order. The `tiered` policy has two:
-
-1. `default`, containing the local disk.
-2. `cold`, containing `s3_cache` (which in turn reads and writes `s3`).
-
-A table opts in with `SETTINGS storage_policy = 'tiered'`. Tables that don't
-set it use a built-in policy also called `default`, which has one volume,
-also called `default`, holding the local disk.
+> **Quick check:** The `s3` disk "stores data in S3". Why does it still need a
+> local `metadata_path`, and what would losing that folder mean?
+>
+> <details><summary>Answer</summary>
+>
+> S3 object names are random; the local metadata files are the only map from
+> part files to objects. Lose them and the objects are still in S3 but
+> ClickHouse can't find them. Those parts are lost on that replica, and you'd
+> recover them from the other replica's copy.
+> </details>
 
 ### Two kinds of trigger
 
@@ -172,6 +172,17 @@ What actually makes data move?
    parts (largest first) to the next volume until enough space is free. This
    is a safety valve so the disk never fills, not a schedule.
 
+> **Quick check:** You set `TTL ... + INTERVAL 1 HOUR TO VOLUME 'cold'` on a
+> table partitioned by day, but nothing moves for hours. Why?
+>
+> <details><summary>Answer</summary>
+>
+> A part moves only when its newest row is past the threshold. Today's parts
+> keep merging with fresh rows, so their newest row is always recent
+> (`move_ttl_info.max` in `system.parts` shows it). Accept day-level moves, or
+> partition more finely and pay with more parts.
+> </details>
+
 ### Move rules also apply at insert time
 
 TTL moves aren't only a background job. When ClickHouse writes a new part,
@@ -186,6 +197,16 @@ they always land on local disk, and ingestion never waits on S3. But if you
 another server as in [module 10](10-copying-data.md)), those inserts write
 directly to S3, at S3 speed and S3 request cost. Lab step 3 shows this: its
 backdated rows end up on S3 the moment the insert finishes.
+
+> **Quick check:** S3 is unreachable for an hour. Do live spans from the
+> gateway still get stored? Does a backfill of last week's spans?
+>
+> <details><summary>Answer</summary>
+>
+> Live spans, yes: they are seconds old, so their parts are written locally.
+> The backfill fails: its parts are already past the move age, so ClickHouse
+> tries to write them straight to S3.
+> </details>
 
 ### TTL moves versus TTL deletes
 
@@ -207,17 +228,15 @@ You can also move by hand:
 `ALTER TABLE t MOVE PARTITION '2026-11-14' TO VOLUME 'cold'` (or
 `TO VOLUME 'default'` to bring it back).
 
-### Things that work the way you'd hope
-
-- **Queries don't change.** A query reads local and S3 parts together.
-- **Live ingestion doesn't touch S3.** New spans are recent, so they're
-  written locally.
-- **A local cache** (`type cache` disk) keeps recently read S3 data on local
-  disk, so repeated queries on cold data don't hit S3 again.
-- **Credentials come from the environment** (`from_env`), or from an IAM role
-  (an AWS identity attached to the machine or pod) with
-  `<use_environment_credentials>true</use_environment_credentials>`; no
-  secrets in config files.
+> **Quick check:** Your `DELETE` TTL is 72 hours, but 75-hour-old spans are
+> still there. Is TTL broken?
+>
+> <details><summary>Answer</summary>
+>
+> Probably not. TTL merges run on a partition at most every 4 hours by
+> default, and with `ttl_only_drop_parts = 1` a part goes only when every row
+> in it has expired. Expect hours of lag.
+> </details>
 
 ### Before you use it in production
 
@@ -226,14 +245,15 @@ on for a real cluster.
 
 | Caveat | What it means for you |
 |---|---|
-| **Each replica writes its own copy to S3** | Two replicas means twice the S3 storage, under separate prefixes (here `clickhouse-01/` and `clickhouse-02/`). "Zero-copy replication" shares one copy, but ClickHouse doesn't recommend it for production. ClickHouse Cloud's SharedMergeTree solves this differently. |
+| **Each replica writes its own copy to S3** | Two replicas means twice the S3 storage, under separate prefixes (here `clickhouse-01/` and `clickhouse-02/`). See the principal engineer's notes for the zero-copy alternative. |
 | **Switching policy is one-way** | A table can only switch to a policy that keeps its current volumes, and once it uses a policy, **that policy and its S3 disk must stay in the server config**. Remove them, and the server can't load the table. |
 | **The local volume must be called `default`** | Existing tables use the built-in `default` policy, whose volume is named `default`. The new policy must keep that volume for them to switch. |
 | **`MODIFY TTL` rewrites existing data** | With the default `materialize_ttl_after_modify = 1`, `ALTER ... MODIFY TTL` starts a **mutation** (a background job that rewrites existing parts) to apply the new rule to every existing part. On a big table that's hours of disk and CPU work, plus S3 uploads. On large tables, run `SET materialize_ttl_after_modify = 0` in the same session first, then apply it later in a quiet period with `ALTER TABLE ... MATERIALIZE TTL IN PARTITION '...'`, one day at a time. |
 | **Config changes: add yes, remove no** | ClickHouse reloads its config when the files change (or on `SYSTEM RELOAD CONFIG`), and in recent versions it picks up **new** disks and policies without a restart. Removing or renaming a disk or volume isn't applied until a restart, and isn't allowed at all while a table uses it. In this lab the question doesn't come up: adding the file means recreating the containers anyway. |
 | **S3 must be reachable at startup** | When it starts, ClickHouse checks that it can write to and read from each S3 disk. If S3 is unreachable, the check fails and the server doesn't start; it doesn't wait. In compose, the ClickHouse services depend on the bucket being created, and `restart: unless-stopped` retries a failed start. |
-| **S3 costs requests, not just bytes** | Merges of parts on S3 read and write S3 again. Many small parts are worse there than locally. Move only settled, older partitions. |
-| **Bucket lifecycle rules** | Make sure no bucket rule (S3's own auto-delete) removes objects ClickHouse still uses. Let ClickHouse's TTL do the deleting. |
+
+S3 request costs, bucket lifecycle rules and S3 outages are in the
+principal engineer's notes below.
 
 ### What to watch once it's on
 
@@ -406,6 +426,60 @@ a large production table, plan for it.
 | Delete after | `DELETE_AFTER`, or `TTL ... DELETE` | `72 HOUR` (`span_red_1m`: 1 year) |
 | Move when the local disk is full | `move_factor` in `storage-s3.xml` | `0.1` (less than 10% free) |
 | Local cache size for S3 reads | `max_size` of `s3_cache` | `1Gi` |
+
+## Principal engineer's notes
+
+**Touch points**
+- ClickHouse to S3 is touch point 6 in [module 0's map](00-setup.md): the S3
+  HTTP API, with bucket, per-replica prefix, region and credentials as the
+  contract. The cloud team usually owns the bucket and its lifecycle rules;
+  ClickHouse owns every object under its prefix. Rename either and the local
+  metadata points at nothing.
+- A part on S3 is local metadata plus remote objects. A disk snapshot of one
+  half restores nothing; use `BACKUP` ([module 12](12-operations.md)).
+- Prefer an IAM role (auto-refreshed) scoped to the prefix: list, get, put,
+  delete, multipart upload. Env-var keys are read at startup, so rotating
+  them means recreating the container.
+
+**At scale**
+- S3 bills per request. A wide part stores each column as its own files;
+  `otel_traces` has 48 columns, so one part is roughly a hundred objects:
+  about a hundred PUTs to move, and GETs per column, per part, to query.
+  Many small parts multiply both, so move only settled, merged days. Merges
+  on the cold volume re-download and re-upload; the volume setting
+  `prefer_not_to_merge` turns them off.
+- Each S3 GET waits tens of milliseconds for its first byte, against well
+  under one for a local SSD. Cold queries take seconds; keep incident
+  dashboards on the hot window.
+- Size the cache to the cold working set (say, the week people reopen for
+  postmortems). It sits on the local disk, competing with hot parts for the
+  free space `move_factor` watches.
+
+**Operational issues**
+- *Regional S3 outage.* Queries on recent partitions keep working (pruning
+  skips cold parts); queries over cold days fail, often after hanging on
+  retries. Live inserts continue; backfills fail (insert-time moves); merges
+  and TTL moves on S3 fail and retry. Stalled moves let the local disk fill;
+  once it's full, inserts fail and the gateway queues ([module 4](04-collector.md)).
+  Don't restart a server mid-outage: it won't start until S3 is back.
+- *Lifecycle rules.* Never let S3 expire or archive (Glacier-type classes)
+  objects ClickHouse still lists; queries and merges on those parts then fail
+  with missing-object errors. Let ClickHouse's TTL delete. The safe rule is
+  "abort incomplete multipart uploads after N days".
+- *Orphaned objects.* Interrupted writes can leave objects no part uses.
+  Compare the bucket size with `bytes_on_disk` of parts on the `s3` disk.
+- Rates and alerting: [module 12](12-operations.md) and the [appendix](appendix-metrics-reference.md).
+
+**Design trade-offs**
+- *Per-replica copies vs zero-copy.* Zero-copy replication
+  (`allow_remote_fs_zero_copy_replication`, off by default) shares one set of
+  objects, with Keeper locks deciding who may delete them. Bugs there have
+  lost data and leaked objects; ClickHouse doesn't recommend it for
+  production. Paying twice for cold storage is cheaper than that risk.
+  ClickHouse Cloud's SharedMergeTree is the supported way to share storage.
+- *Tiering vs exporting.* Tiering keeps one table and one query surface. For
+  archives almost never read, exporting old days to Parquet in S3 (read with
+  the `s3()` table function) is cheaper and independent of server config.
 
 ## Lab (25 min)
 
@@ -647,9 +721,8 @@ place. Your choices:
 > when a part is written, so live spans land locally but backfilled old rows
 > go straight to S3. `move_factor` moves parts early when the local disk is
 > nearly full. Deletes happen in TTL merges, which can lag by hours. Queries
-> read both tiers transparently, and the cache keeps hot S3 data local. Each
-> replica writes its own copy to S3, `MODIFY TTL` rewrites existing parts, and
-> once a table uses a policy, the policy must stay in the config."
+> read both tiers, and the cache keeps hot S3 data local. Each replica writes
+> its own copy to S3, and once a table uses a policy, the policy must stay."
 
 ## Recap
 
@@ -675,29 +748,21 @@ place. Your choices:
 
 ## Check yourself
 
-<details><summary>You set <code>TTL ... + INTERVAL 1 HOUR TO VOLUME 'cold'</code>, but nothing moves for hours. Why?</summary>
+<details><summary>During an S3 outage, an engineer looks up one trace by trace id from 20 minutes ago and it works; the same lookup for a trace from three days ago fails. Why? (mixes modules 9 and 11)</summary>
 
-A part moves only when all its rows are past the threshold. With daily
-partitions, today's partition keeps getting new parts, and merges fold them
-into bigger parts whose newest row is always recent. Check `move_ttl_info.max`
-in `system.parts`. Either accept day-level granularity, or partition more
-finely, which means more parts.
+The trace-id lookup table points the query at the right time range
+([module 9](09-sharding-indexes.md)), and the time filter prunes to the
+matching day's partition. Twenty minutes ago is today, on local disk; three
+days ago is on S3, which is unreachable. Pruning is why recent queries survive
+an S3 outage.
 </details>
 
-<details><summary>Does moving data to S3 slow down ingestion?</summary>
+<details><summary>A cloud admin adds a bucket rule "delete objects older than 30 days" to save money, while ClickHouse keeps <code>span_red_1m</code> for a year. What happens?</summary>
 
-Not for live traffic. New spans are seconds old, so their parts are written to
-local disk, and moves happen in the background. A backfill of old data is
-different: ClickHouse applies the move TTL when it writes each part, so parts
-that are already past it are written straight to S3, at S3 speed.
-</details>
-
-<details><summary>Your <code>DELETE</code> TTL is 72 hours, but 75-hour-old spans are still there. Is TTL broken?</summary>
-
-Probably not. Deletes happen in TTL merges, and ClickHouse runs one on a
-partition at most every `merge_with_ttl_timeout` seconds (4 hours by
-default). With `ttl_only_drop_parts = 1` it also waits until every row in a
-part has expired. Expect expiry to lag by hours.
+After 30 days S3 deletes objects that `span_red_1m` parts on the cold volume
+still use. ClickHouse still lists those parts, so queries and merges touching
+them fail with missing-object errors. Remove the rule and let ClickHouse's
+TTL do the deleting.
 </details>
 
 <details><summary>What's the difference between a disk, a volume and a storage policy?</summary>
