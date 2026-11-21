@@ -2,11 +2,12 @@
 # gives both ClickHouse replicas an S3 disk and a "tiered" storage policy.
 #   docker compose -f compose.yaml -f docs/tutorial/labs/compose.s3-tiering.yaml up -d
 #   docs/tutorial/labs/enable-s3-tiering.sh
-# Back to local-only storage: see "Turn it off" in docs/tutorial/11-s3-tiering.md.
+# Back to local-only storage: see "Turning it off" in docs/tutorial/11-s3-tiering.md.
 # Paths are relative to the repo root (the first compose file's folder).
 #
-# For real S3, drop the seaweedfs services and set S3_ENDPOINT to
-# https://<bucket>.s3.<region>.amazonaws.com/<prefix>/<replica>/ plus real credentials.
+# For real S3, drop the seaweedfs services and set S3_ENDPOINT_BASE to
+# https://<bucket>.s3.<region>.amazonaws.com/<prefix> plus real credentials;
+# each replica appends its own /clickhouse-0N/ folder.
 
 services:
   seaweedfs:

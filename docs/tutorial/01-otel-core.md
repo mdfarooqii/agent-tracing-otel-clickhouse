@@ -1,13 +1,12 @@
-# Module 1: OpenTelemetry core (55 min)
+# Module 1: OpenTelemetry core (50 min)
 
 ## Why this matters
 
 Every other module builds on the words in this one. When the gateway drops a
 span, when a trace is "broken" between two services, or when a ClickHouse
 query joins a client span to a server span, the explanation is always one of
-the ideas here: spans, trace ids, context, propagation, resources, or the
-SDK's export pipeline. Get these clear and the rest of the tutorial is just
-details.
+the ideas here: spans, context, propagation, resources, or the SDK's export
+pipeline.
 
 What you'll be able to do after this module:
 
@@ -16,53 +15,38 @@ What you'll be able to do after this module:
   call, and read a `traceparent` header by eye.
 - Say whether a fact belongs on the resource, on a span attribute, or in
   baggage.
-- Follow a finished span through the SDK (tracer provider, span processor,
-  exporter) and out over OTLP, and say what happens when that path is blocked.
+- Follow a finished span through the SDK and out over OTLP, and say what
+  happens when that path is blocked.
 
 ## Key terms
 
+Reminder from [module 0](00-setup.md): a **span** is the record of one timed
+step, and a **trace** is all the spans of one request.
+
 | Term | Plain meaning |
 |---|---|
-| **OpenTelemetry (OTel)** | An open standard plus a set of libraries for producing telemetry (traces, metrics, logs) and sending it somewhere |
-| **Span** | The record of one timed operation: a name, a start time, an end time, and facts about it |
-| **Trace** | All the spans of one request, joined into a tree |
-| **Trace id** | A random 16-byte id shared by every span in one trace, like a parcel's tracking number |
-| **Span id** | A random 8-byte id unique to one span |
-| **Parent span** | The span that was running when this span started. Each span stores its parent's span id |
-| **Root span** | The first span of a trace. It has no parent. Here it's `agent_turn` |
-| **Span kind** | Which role the span plays: internal work, calling out (`CLIENT`), or being called (`SERVER`), and two messaging kinds |
-| **Status** | Whether the operation failed: `UNSET` (default, no failure recorded), `OK`, or `ERROR` |
+| **Span id, parent span id** | A span's own random id, and the id of the span it sits under. A span with no parent is the **root span** |
+| **Span kind** | The span's role: internal work, calling out (`CLIENT`), or being called (`SERVER`) |
+| **Status** | Whether the operation failed: `UNSET` (default), `OK`, or `ERROR` |
 | **Attribute** | A key-value fact about one span, such as `http.response.status_code = 504` |
-| **Event** | A timestamped note inside a span, such as an `exception` with a stack trace |
-| **Cardinality** | How many different values a field can have. A route template has few; a SKU or request id has many |
 | **Context** | An invisible "which span am I inside right now?" value that OpenTelemetry carries through your code |
-| **Propagation** | Writing the context into an outgoing request, and reading it back on the other side, so a trace can cross processes |
-| **Header** | A `name: value` line sent with an HTTP request |
-| **`traceparent`** | The standard HTTP header that carries the trace id and the caller's span id |
+| **Propagation, `traceparent`** | Writing the context into an outgoing request's headers, and reading it back on the other side. `traceparent` is the standard header for it |
 | **Baggage** | Key-value pairs (such as a tenant name) that travel with a request to downstream services, in the `baggage` header |
 | **Resource** | Key-value facts about *who* produced the spans: service name, version, owner. Set once per process |
-| **Labels** | This repo's word for the `org.*` attributes and resource attributes, such as `org.owner` and `org.tenant` |
-| **API** | The OpenTelemetry package that code calls to create spans. Does nothing on its own |
-| **SDK** | The OpenTelemetry package that actually records, samples, buffers and sends spans |
-| **Tracer provider** | The SDK object that holds the configuration (resource, sampler, processors) for a whole process |
-| **Tracer** | The object you call to start spans. You get one from the tracer provider |
-| **Sampler** | The SDK part that decides, when a span starts, whether to record it (module 5) |
-| **Span processor** | The SDK part that is told about every span that ends, and passes it on |
-| **Batch span processor** | A span processor that queues finished spans and sends them in groups from a background thread |
-| **Exporter** | The SDK part that sends spans out of the process, for example over the network |
-| **OTLP** | OpenTelemetry Protocol: the standard format and protocol for sending telemetry over the network |
+| **API, SDK** | The API is the package code calls to create spans, and does nothing on its own. The SDK is the package that records and sends them |
+| **Tracer provider, tracer, instrumentation scope** | The provider holds the SDK setup for a process; a tracer starts spans; the tracer's name is the instrumentation scope |
+| **Span processor, exporter, OTLP** | The processor queues finished spans; the exporter sends them; OTLP (OpenTelemetry Protocol) is the format they travel in |
 
 ## Idea
 
 ### The running example
 
-We'll follow one request through every concept. The background traffic runs
-the **support agent** (`agent/run.py --agent support-agent`). On one turn the
-user asks *"What is a trace?"*. During that turn:
+We'll follow one request through every concept: the **support agent**'s turn
+where the user asks *"What is a trace?"*. During that turn:
 
 1. `run.py` starts a span called `agent_turn` for the whole turn.
-2. The LangGraph graph runs (module 2). Its supervisor and researcher nodes
-   each make an LLM call.
+2. The LangGraph graph runs ([module 2](02-langgraph.md)). Its supervisor and
+   researcher nodes each make an LLM call.
 3. The researcher calls the tool `search_knowledge_base`, which sends
    `GET /v1/search` to `kb-search-api`, a separate Python process on port
    `18081`.
@@ -83,8 +67,8 @@ inside which, so you can find the slow or broken one.
 **What.** A **span** is the record of one timed operation. Think of it as one
 line on a restaurant order ticket: "grill steak, started 19:02:10, finished
 19:09:40, table 12". A **trace** is the whole ticket: every line for one
-order. In OpenTelemetry, the thing that ties the lines together is the
-**trace id**: every span of one request carries the same one.
+order. The thing that ties the lines together is the **trace id**: every span
+of one request carries the same one.
 
 The tree shape comes from the **parent span id**. Each span remembers which
 span was running when it started. A good picture is a family tree: the trace
@@ -96,27 +80,24 @@ Here are the fields every span has:
 
 | Field | Example | Note |
 |---|---|---|
-| `trace_id` | `12d64ae6b9afa411e15ca3a7c1726609` | 16 bytes (32 hex characters), same for every span in the trace |
-| `span_id` | `01aa4e70b23ff052` | 8 bytes (16 hex characters), unique per span |
-| `parent_span_id` | `2d1b1ef9f9ccc966` | Empty for the root span |
-| `name` | `execute_tool search_knowledge_base` | Low cardinality: no ids in names |
-| `kind` | `INTERNAL`, `CLIENT`, `SERVER`, `PRODUCER`, `CONSUMER` | Who is calling whom |
+| `trace_id` | `386d73b95ebe85beba3ae0906345d043` | 16 bytes (32 hex characters), same for every span in the trace |
+| `span_id` | `2b82646cf09c0fad` | 8 bytes (16 hex characters), unique per span |
+| `parent_span_id` | `9d8147dae245aec6` | Empty for the root span |
+| `name` | `GET /v1/search` | What kind of operation; no ids in names |
+| `kind` | `INTERNAL`, `CLIENT`, `SERVER` | Who is calling whom |
 | `status` | `UNSET`, `OK`, `ERROR` | Only set `ERROR` for failures |
-| start and end time | `2026-11-21T17:32:03.144649Z` | Duration is end minus start |
-| attributes | `http.response.status_code=504` | Facts about this operation |
-| events | `exception` with a stack trace | Timestamped points inside a span |
-| links | Pointer to a span in another trace | For batches and fan-in, not parent/child |
+| start and end time | `2026-11-21T05:32:34.227963Z` | Duration is end minus start |
+| attributes | `http.response.status_code=200` | Facts about this operation |
+| events | `exception` with a stack trace | Timestamped notes inside a span |
 
-A few of these need a closer look.
+The example values are the `kb-search-api` span from module 0.
 
-**Name and cardinality.** The name says *what kind* of operation this is, so
-you can group "all searches" together. It must not contain ids. The number of
-distinct values a field can take is its **cardinality**: `GET /v1/search` is
-one value, but a name with a SKU in it would be a new value for every SKU, and
-grouping by name would stop working. Specific values go in attributes instead.
-This repo names HTTP spans after the **route template**, the URL pattern with
-placeholders. `pricing-api`'s span is called `GET /v1/prices/{sku}`, not
-`GET /v1/prices/SKU-200`.
+**Name.** The name says *what kind* of operation this is, so you can group
+"all searches" together. It must not contain ids: a name with a SKU in it
+would be a new name for every SKU, and grouping by name would stop working.
+Specific values go in attributes instead. This repo names HTTP spans after the
+**route template**, the URL pattern with placeholders: `pricing-api`'s span is
+called `GET /v1/prices/{sku}`, not `GET /v1/prices/SKU-200`.
 
 **Kind.** The kind says what role the span plays:
 
@@ -124,12 +105,11 @@ placeholders. `pricing-api`'s span is called `GET /v1/prices/{sku}`, not
   `execute_tool ...` are internal.
 - `CLIENT`: this process is calling something else and waiting for the
   answer. `call_api` creates a `CLIENT` span for each HTTP call. The `chat`
-  spans for LLM calls are `CLIENT` too, and so is `ticket-api`'s
-  `INSERT tickets` database span.
+  spans for LLM calls are `CLIENT` too.
 - `SERVER`: this process is handling a call from someone else. Every API
   request handler in `apis.py` creates a `SERVER` span.
-- `PRODUCER` and `CONSUMER`: the two ends of a message queue. This repo
-  doesn't use them.
+
+(There are two more kinds for message queues; this repo doesn't use them.)
 
 **Status.** Status answers one question: did this operation fail? It starts
 as `UNSET`, which means "nothing went wrong that we know of". Code sets
@@ -137,18 +117,13 @@ as `UNSET`, which means "nothing went wrong that we know of". Code sets
 5xx responses: a 404 is the caller's mistake, not a failure of the API.
 `run.py` sets `OK` on `agent_turn` when the turn succeeds.
 
-**Attributes.** Key-value facts about this one span: the HTTP method, the
-response code, the model name, the tenant. Standard names such as
+**Attributes and events.** Attributes are key-value facts about this one span:
+the HTTP method, the response code, the model name. Standard names such as
 `http.request.method` come from the **semantic conventions** (semconv), an
-agreed list of attribute names so every tool reads them the same way. The
-`gen_ai.*` ones are the subject of [module 3](03-genai-semconv.md).
-
-**Events and links.** An **event** is a timestamped note inside a span. When
-a tool fails, `LangGraphTracer` calls `span.record_exception(error)`, which
-adds an `exception` event with the error message and stack trace. A **link**
-points to a span in a *different* trace, for cases such as one batch job
-processing messages from many requests. Links are not parent-child
-relationships; this repo doesn't create any.
+agreed list of attribute names so every tool reads them the same way; the
+`gen_ai.*` ones are the subject of [module 3](03-genai-semconv.md). An
+**event** is a timestamped note inside a span; when a tool fails, the repo
+records an `exception` event with the error message and stack trace.
 
 **Worked example: the client/server pair.** When the researcher's tool calls
 `kb-search-api`, two spans describe the same HTTP call, one in each process:
@@ -197,13 +172,6 @@ span was current, so it became a root span and got a brand-new random trace
 id. The same thing happens in `run.py`: `agent_turn` starts with nothing
 current, so it is the root of the turn's trace.
 
-There's a second way to start spans: `start_span(...)` with an explicit
-`context=` argument. It records a span but does *not* make it current.
-`LangGraphTracer` uses that, because LangChain's callbacks tell it the parent
-directly. [Module 2](02-langgraph.md) explains the one place this matters:
-the tool span has to be made current with `context.attach(...)`, or the HTTP
-calls inside the tool would get the wrong parent.
-
 ### Propagation: carrying context across the network
 
 **Why.** Context lives in memory, inside one process. `kb-search-api` is a
@@ -218,7 +186,7 @@ the `name: value` lines sent before the body of an HTTP request (like
 from the W3C (the web standards body):
 
 - `traceparent`: the trace id and the caller's span id.
-- `baggage`: the baggage key-value pairs.
+- `baggage`: the baggage key-value pairs (explained below).
 
 The analogy: when you visit another office, you carry a letter of
 introduction that says "this visitor belongs to case 386d73b9, sent by person
@@ -251,8 +219,8 @@ names the sender as the parent.
   as `Traceparent` with a capital T, and the extractor looks up the
   lower-case key `traceparent`.
 
-**Reading a `traceparent` header.** Here is a real pair of headers, printed by
-the lab script:
+**Reading a `traceparent` header.** Here is a pair of headers printed by the
+lab script:
 
 ```text
 traceparent: 00-12d64ae6b9afa411e15ca3a7c1726609-01aa4e70b23ff052-03
@@ -281,6 +249,76 @@ sequenceDiagram
   S-->>C: HTTP 200
 ```
 
+Nothing about this is AI-specific: any HTTP service, database client or batch
+job joins a trace the same way. [Module 6](06-cross-environment.md) covers
+what has to hold for that to work across services and environments.
+
+### Lab 1 (5 min): spans, context and headers
+
+Run the lab script. It sets up OpenTelemetry with an exporter that prints
+spans to the terminal instead of sending them, starts `parent` and then
+`child` inside it, and prints the headers that `propagate.inject` would send:
+
+```bash
+cd agent && .venv/bin/python ../docs/tutorial/labs/hello_span.py
+```
+
+You should see something like this (ids are random, and the output is
+shortened):
+
+```text
+Headers a client would send: {'traceparent': '00-979bfbd9d471a3865291b978e75b8e35-d90841a00167415a-03', 'baggage': 'org.tenant=acme_corp'}
+{
+    "name": "child",
+    "context": {
+        "trace_id": "0x979bfbd9d471a3865291b978e75b8e35",
+        "span_id": "0xd90841a00167415a",
+        ...
+    },
+    "kind": "SpanKind.INTERNAL",
+    "parent_id": "0x321b58bf3d7e32fa",
+    ...
+    "attributes": {
+        "step": 1
+    },
+    ...
+    "resource": {
+        "attributes": {
+            "telemetry.sdk.language": "python",
+            "telemetry.sdk.name": "opentelemetry",
+            "telemetry.sdk.version": "...",
+            "service.instance.id": "...",
+            "service.name": "hello",
+            "org.owner": "me"
+        },
+        ...
+    }
+}
+{
+    "name": "parent",
+    "context": {
+        "trace_id": "0x979bfbd9d471a3865291b978e75b8e35",
+        "span_id": "0x321b58bf3d7e32fa",
+        ...
+    },
+    "parent_id": null,
+    ...
+}
+```
+
+Look for:
+
+- `child.parent_id` equals `parent`'s `span_id`, and both share a `trace_id`.
+  `parent` has `parent_id: null`: it's the root.
+- The span id inside `traceparent` is `child`'s span id, because `inject` ran
+  while `child` was current. A server receiving this request would become
+  `child`'s child.
+- `child` printed **before** `parent`: spans are sent when they *end*, and the
+  inner `with` block ends first.
+
+Keep this output handy: the `baggage` header and the `resource` block are the
+next two sections.
+
 ### Baggage: request-wide values you carry along
 
 **Why.** Some facts belong to the whole request, not to one span: which
@@ -292,7 +330,9 @@ process.
 sent in the `baggage` header with every outgoing call. The key point:
 baggage is *not* automatically added to spans. It's like luggage you carry on
 a trip: it goes everywhere with you, but nobody unpacks it unless they choose
-to. Each receiver decides which keys, if any, to copy onto its own spans.
+to. Each receiver decides which keys, if any, to copy onto its own spans. Look
+at the Lab 1 output: `org.tenant` is in the `baggage` header but in neither
+span's attributes.
 
 **How it looks in this repo.**
 
@@ -336,9 +376,10 @@ you'd repeat the same values millions of times.
 **What.** The **resource** describes the producer: `service.name`,
 `service.version`, `deployment.environment.name`, and in this repo also
 `org.owner` and `org.service`. It's set once, when the process sets up
-tracing, and attached to every span the process exports. Rule of thumb:
-**resource = who, attributes = what**. The resource is the return address on
-an envelope; attributes are what's written in the letter.
+tracing, and attached to every span the process exports. In the Lab 1 output,
+the `resource` block is identical on both spans for that reason. Rule of
+thumb: **resource = who, attributes = what**. The resource is the return
+address on an envelope; attributes are what's written in the letter.
 
 **How it looks in this repo.** `setup_tracing` in `agent/telemetry.py` builds
 it from the service name plus whatever attributes the caller passes:
@@ -348,12 +389,19 @@ resource = Resource.create({"service.name": service_name, **attributes}, schema_
 ```
 
 `run.py` passes `service.namespace`, `service.version`,
-`deployment.environment.name`, `org.service` and `org.owner` (for
+`deployment.environment.name=local`, `org.service` and `org.owner` (for
 support-agent, `org.owner=ai-platform`). `apis.py` passes the shared
-`COMMON_RESOURCE` plus each API's own labels. `Resource.create` also adds
-`telemetry.sdk.*` attributes (the SDK's language, name and version) and
-merges in anything from the `OTEL_RESOURCE_ATTRIBUTES` environment variable,
-which is how lab step 2 changes the resource without editing code.
+`COMMON_RESOURCE` plus each API's own labels.
+
+`Resource.create` also merges in two other sources: `telemetry.sdk.*`
+attributes (the SDK's language, name and version) and anything in the
+`OTEL_RESOURCE_ATTRIBUTES` environment variable. The attributes passed in code
+are applied **last, on top**, so the environment variable can only **add**
+keys the code doesn't set; it can't change ones it does. For example, `run.py`
+hard-codes `deployment.environment.name=local`, so setting
+`OTEL_RESOURCE_ATTRIBUTES=deployment.environment.name=prod` on an agent changes
+nothing, while `OTEL_RESOURCE_ATTRIBUTES=lab.run=test1` adds a new
+`lab.run` key. Lab 2 shows both.
 
 ### Labels: resource labels and span labels
 
@@ -379,18 +427,6 @@ A quick way to decide where a fact goes:
 | Does it describe this one operation? | A span attribute | `http.response.status_code=504` |
 | Does a *downstream* service need it too? | Baggage, then copy it onto spans where wanted | `org.tenant=globex` |
 
-### Spans from non-agentic services
-
-An HTTP API, a database or a batch job with no LLM joins the agent's trace the
-same way: it **continues the trace id** it receives in `traceparent`. There is
-no merge step later. If the service extracts the context, its server span gets
-the caller's trace id, with the caller's client span as its parent. Nothing
-about the API in `apis.py` is AI-specific; it's an ordinary HTTP server with
-four lines of propagation code. [Module 8](08-cross-environment.md) lists
-everything that has to hold for that to work across environments, and
-`apis.py` can simulate a proxy that strips the headers
-(`STRIP_TRACE_HEADERS=1`).
-
 ### API and SDK: why there are two packages
 
 **Why.** A library author (say, of an HTTP client) wants to add spans to their
@@ -401,11 +437,11 @@ goes. So OpenTelemetry splits the job in two.
 
 - The **API** (`opentelemetry-api`) is the set of calls that create spans:
   `trace.get_tracer(...)`, `start_as_current_span(...)`,
-  `propagate.inject(...)`. Libraries depend only on this. If no SDK tracer
-  provider has been set up, every call is a **no-op** (it does nothing and
-  records nothing), so instrumented libraries cost almost nothing.
+  `propagate.inject(...)`. Libraries depend only on this. If no SDK has been
+  set up, every call is a **no-op** (it does nothing and records nothing), so
+  instrumented libraries cost almost nothing.
 - The **SDK** (`opentelemetry-sdk`) is the real implementation, chosen by the
-  application owner: `TracerProvider`, samplers, span processors, exporters.
+  application owner: the tracer provider, span processors, exporters.
 
 It's like a wall socket and a power plant. Appliances (libraries) are built to
 the socket standard (the API). Until someone connects the house to a power
@@ -419,13 +455,13 @@ is the only place that touches the SDK, and it runs once at process start.
 Here is the path a span takes inside one process:
 
 ```text
-Tracer ─start_span─▶ Sampler ─▶ Span ─end()─▶ SpanProcessor ─▶ Exporter ─OTLP─▶ Collector
-          (API)       (keep?)                  (Batch: queue)     (HTTP/gRPC)
+Tracer ─start span─▶ Span ─end()─▶ SpanProcessor ─▶ Exporter ─OTLP─▶ Collector
+ (API)                              (Batch: queue)    (HTTP)
 ```
 
 The analogy is a post office. You write letters (spans) at your desk. When a
 letter is finished, you drop it in the out-tray (the span processor). A clerk
-collects the tray every few minutes, or sooner if it fills up, and drives the
+collects the tray every few seconds, or sooner if it fills up, and drives the
 bundle to the sorting center (the exporter sends it to the Collector).
 
 Each piece, as `setup_tracing` builds it:
@@ -442,17 +478,27 @@ trace.set_tracer_provider(provider)                                             
    already set.
 2. Builds the resource ("who am I").
 3. Creates the **tracer provider**: the one object per process that holds the
-   resource, the sampler and the processors. No sampler is passed, so the
-   SDK's default is used unless `OTEL_TRACES_SAMPLER` says otherwise. The
-   default records every root span, and follows the caller's decision for
-   child spans ([module 5](05-sampling.md)).
+   SDK setup. It also holds the sampler, the part that decides whether to
+   record a trace at all. No sampler is passed here, so the SDK default,
+   `parentbased_always_on`, is used unless `OTEL_TRACES_SAMPLER` says
+   otherwise: root spans are always recorded, and child spans follow their
+   parent's decision. [Module 5](05-sampling.md) covers sampling.
 4. Adds a **batch span processor** that feeds an **OTLP exporter**.
 5. Registers the provider globally, so every API call in the process now
    goes to the SDK instead of being a no-op.
 
-After that, `get_tracer()` asks the provider for a **tracer**, the object
-with `start_as_current_span`. The tracer's name and version
-(`"agent-tracing"`, `"0.1.0"`) identify the code that made the spans.
+**The tracer and its instrumentation scope.** `get_tracer()` asks the provider
+for a **tracer**, the object with `start_as_current_span`:
+
+```python
+trace.get_tracer("agent-tracing", "0.1.0", schema_url=SCHEMA_URL)
+```
+
+The name and version, `agent-tracing` and `0.1.0`, are the **instrumentation
+scope**: they say which code made the span (an instrumented HTTP library would
+use its own name). Every span carries its scope, and in ClickHouse it becomes
+the `ScopeName` and `ScopeVersion` columns ([module 8](08-data-model.md)). In
+this repo every span, from agents and APIs alike, has scope `agent-tracing`.
 
 **The batch span processor.** `BatchSpanProcessor` keeps finished spans in an
 in-memory queue and exports them in batches from a background thread, so your
@@ -478,11 +524,12 @@ built on HTTP/2, port 4317). This repo maps them to 14318 and 14317 on the
 host; the Python code uses HTTP. The lab uses `ConsoleSpanExporter`, which
 prints spans as JSON instead of sending them.
 
-**Configuration without code changes.** Almost everything can be set through
+**Configuration without code changes.** Much of this can be set through
 environment variables: `OTEL_EXPORTER_OTLP_ENDPOINT` (where to send),
-`OTEL_RESOURCE_ATTRIBUTES` (extra resource attributes), `OTEL_TRACES_SAMPLER`
-(which sampler), `OTEL_BSP_MAX_QUEUE_SIZE` and `OTEL_BSP_SCHEDULE_DELAY` (the
-batch processor's queue size and delay; BSP stands for batch span processor).
+`OTEL_RESOURCE_ATTRIBUTES` (extra resource attributes; adds keys, but can't
+replace keys set in code), `OTEL_TRACES_SAMPLER` (which sampler),
+`OTEL_BSP_MAX_QUEUE_SIZE` and `OTEL_BSP_SCHEDULE_DELAY` (the batch processor's
+queue size and delay; BSP stands for batch span processor).
 
 ### Putting it together
 
@@ -518,15 +565,13 @@ the out-tray, exporter = the courier, OTLP = the shape of the parcel.**
   `BatchSpanProcessor`, `OTLPSpanExporter`. The endpoint defaults to
   `http://localhost:14318`.
 - `agent/telemetry.py`, `get_tracer`: the tracer every span in the repo is
-  started from.
+  started from (scope `agent-tracing`).
 - `agent/telemetry.py`, `call_api`: a `CLIENT` span per HTTP call, and
   `propagate.inject(headers)`.
-- `agent/apis.py`, the request handler: `propagate.extract(...)` and a
-  `SERVER` span whose parent is the caller's client span. Note the header
-  names are lower-cased first, because Python's `urllib` sends
-  `Traceparent` with a capital T, and the extractor looks up lower-case keys.
-  `SERVICES` shows each API's resource labels and which baggage keys it copies
-  (`span_labels`).
+- `agent/apis.py`, the request handler: `propagate.extract(...)` on
+  lower-cased headers, and a `SERVER` span whose parent is the caller's client
+  span. `SERVICES` shows each API's resource labels and which baggage keys it
+  copies (`span_labels`).
 - `agent/run.py`: puts `org.request_id` and `org.tenant` into baggage before
   each turn, starts the root `agent_turn` span, and calls
   `provider.shutdown()` at the end.
@@ -536,91 +581,39 @@ the out-tray, exporter = the courier, OTLP = the shape of the parcel.**
 - `docs/tutorial/labs/hello_span.py`: the smallest possible example: two
   nested spans, baggage, and the headers `inject` writes.
 
-## Lab (15 min)
+## Lab 2 (10 min): resource, and spans in ClickHouse
 
-1. **Make spans and print them, without any backend.** The script sets up a
-   tracer provider with a console exporter, puts `org.tenant` in baggage,
-   starts `parent` and then `child` inside it, and prints the headers that
-   `propagate.inject` would send:
+Lab 1 is in the middle of the Idea section. Run these from the `agent`
+directory.
 
-   ```bash
-   cd agent && .venv/bin/python ../docs/tutorial/labs/hello_span.py
-   ```
-
-   You should see something like this (ids are random, and the output is
-   shortened):
-
-   ```text
-   Headers a client would send: {'traceparent': '00-979bfbd9d471a3865291b978e75b8e35-d90841a00167415a-03', 'baggage': 'org.tenant=acme_corp'}
-   {
-       "name": "child",
-       "context": {
-           "trace_id": "0x979bfbd9d471a3865291b978e75b8e35",
-           "span_id": "0xd90841a00167415a",
-           ...
-       },
-       "kind": "SpanKind.INTERNAL",
-       "parent_id": "0x321b58bf3d7e32fa",
-       ...
-       "attributes": {
-           "step": 1
-       },
-       ...
-       "resource": {
-           "attributes": {
-               "telemetry.sdk.language": "python",
-               "telemetry.sdk.name": "opentelemetry",
-               "telemetry.sdk.version": "...",
-               "service.instance.id": "...",
-               "service.name": "hello",
-               "org.owner": "me"
-           },
-           ...
-       }
-   }
-   {
-       "name": "parent",
-       "context": {
-           "trace_id": "0x979bfbd9d471a3865291b978e75b8e35",
-           "span_id": "0x321b58bf3d7e32fa",
-           ...
-       },
-       "parent_id": null,
-       ...
-   }
-   ```
-
-   Look for:
-   - The `Headers a client would send:` line, with `traceparent` and `baggage`.
-     The span id inside `traceparent` is `child`'s span id, because `inject`
-     ran while `child` was current.
-   - `child` printed **before** `parent`: spans are exported when they *end*,
-     and the inner `with` block ends first.
-   - `child.parent_id` equals `parent.context.span_id`, and both share a
-     `trace_id`. `parent` has `parent_id: null`: it's the root.
-   - The resource block: your attributes plus `telemetry.sdk.*` added by the
-     SDK. It's identical on both spans, because it belongs to the process.
-   - `org.tenant` is in the `baggage` header but **not** in either span's
-     attributes: baggage isn't copied onto spans unless code does it.
-
-2. **Change the resource without changing code.** `OTEL_RESOURCE_ATTRIBUTES`
-   adds resource attributes from the environment; `grep` keeps only the
-   matching lines:
+1. **Add to the resource without changing code, and see what you can't
+   change.** `hello_span.py` sets `service.name` and `org.owner=me` in code,
+   but not `deployment.environment.name`. Set both through
+   `OTEL_RESOURCE_ATTRIBUTES` (comma-separated `key=value` pairs); `grep`
+   keeps only the matching lines:
 
    ```bash
-   OTEL_RESOURCE_ATTRIBUTES=deployment.environment.name=lab .venv/bin/python ../docs/tutorial/labs/hello_span.py | grep environment
+   OTEL_RESOURCE_ATTRIBUTES=deployment.environment.name=lab,org.owner=someone-else \
+     .venv/bin/python ../docs/tutorial/labs/hello_span.py | grep -E 'environment|org.owner'
    ```
 
    ```text
                "deployment.environment.name": "lab",
+               "org.owner": "me",
                "deployment.environment.name": "lab",
+               "org.owner": "me",
    ```
 
-   One line per span, because the resource is attached to every span the
-   process exports. The same variable works for the agents and APIs, since
-   `setup_tracing` uses `Resource.create`.
+   What to notice:
+   - Two of each line, one per span, because the resource is attached to
+     every span the process exports.
+   - `deployment.environment.name=lab` was **added**: the code didn't set it.
+   - `org.owner` is still `me`: the code sets it, and code attributes win. The
+     agents and APIs behave the same way, since `setup_tracing` also uses
+     `Resource.create`. That's why the agents' `deployment.environment.name`
+     stays `local` whatever the variable says.
 
-3. **Find the client/server pair in ClickHouse.** Open
+2. **Find the client/server pair in ClickHouse.** Open
    <http://localhost:8123/play> (user `default`, password `demo`). This query
    joins the table to itself: for each `Client` span `c`, it finds a `Server`
    span `s` in the same trace whose parent is `c`, then counts the pairs:
@@ -650,6 +643,21 @@ the out-tray, exporter = the courier, OTLP = the shape of the parcel.**
      gateway dropped `legacy-hr-api`'s server spans, so the join finds no
      partner.
 
+3. **See the instrumentation scope.** In the same Play UI:
+
+   ```sql
+   SELECT ScopeName, ScopeVersion, count() AS spans
+   FROM otel.otel_traces GROUP BY ScopeName, ScopeVersion;
+   ```
+
+   ```text
+   agent-tracing  0.1.0  51562
+   ```
+
+   One row: every span in the repo comes from the tracer `get_tracer()`
+   returns. If you added an auto-instrumented library, its spans would show up
+   under its own scope name.
+
 ## Explain it back
 
 > "A span is a timed operation with attributes and a status; spans with the
@@ -657,15 +665,15 @@ the out-tray, exporter = the courier, OTLP = the shape of the parcel.**
 > span lives in the context, so nested spans become children. Between
 > processes, the client injects the W3C `traceparent` header, and the server
 > extracts it and starts its span as a child of the client span. Baggage rides
-> along for request-wide values like tenant. The SDK samples, buffers spans in
-> a batch processor, and exports them over OTLP; the resource tells the backend
-> which service sent them."
+> along for request-wide values like tenant. The SDK buffers spans in a batch
+> processor and exports them over OTLP; the resource tells the backend which
+> service sent them."
 
 ## Recap
 
 - A span is one timed step; a trace is every span of one request, tied
   together by a shared trace id and arranged into a tree by parent span ids.
-- Span names stay low cardinality (route templates, not ids); specific values
+- Span names don't contain ids (route templates, not SKUs); specific values
   go in attributes.
 - A `CLIENT` span in the caller and a `SERVER` span in the callee describe the
   same call; the server span's parent is the client span.
@@ -677,19 +685,22 @@ the out-tray, exporter = the courier, OTLP = the shape of the parcel.**
   it, as `apis.py` does for `org.tenant` and `org.request_id`.
 - Resource = who (once per process), attributes = what (per span). The
   gateway requires `org.owner` and `org.service` on the resource.
-- The API is a no-op until the SDK is set up. The SDK's tracer provider holds
-  the resource, sampler and processors; the batch processor queues spans; the
-  exporter sends them over OTLP; `shutdown()` flushes the queue.
+  `OTEL_RESOURCE_ATTRIBUTES` can add resource keys but not override keys set
+  in code.
+- The API is a no-op until the SDK is set up. The tracer provider holds the
+  setup; the tracer's name is the instrumentation scope (`ScopeName`); the
+  batch processor queues spans; the exporter sends them over OTLP;
+  `shutdown()` flushes the queue.
 
 ## Check yourself
 
 <details><summary>A span's name is <code>GET /v1/prices/sku-123</code>. What's wrong?</summary>
 
-The name contains an id, so it has unbounded cardinality: every SKU becomes a
-different span name, which breaks grouping and indexing. Use the route
-template (`GET /v1/prices/{sku}`) and put the SKU in an attribute if needed.
-This repo does that through `url.template` on the client span (and
-`http.route` on the server span).
+The name contains an id, so every SKU becomes a different span name, which
+breaks grouping and indexing. Use the route template
+(`GET /v1/prices/{sku}`) and put the SKU in an attribute if needed. This repo
+does that through `url.template` on the client span (and `http.route` on the
+server span).
 </details>
 
 <details><summary>What happens to spans if the collector is down for 10 minutes?</summary>
@@ -702,25 +713,34 @@ durable buffer. That's one reason to run a Collector close to the app.
 <details><summary>Why doesn't baggage show up as span attributes by itself?</summary>
 
 Baggage is propagated data, not telemetry; copying it everywhere could leak
-data or blow up cardinality. Each service decides which baggage keys to copy
-onto its spans (or uses a baggage span processor to do it for all spans).
+data or add a huge number of distinct values to every span. Each service
+decides which baggage keys to copy onto its spans (or uses a baggage span
+processor to do it for all spans).
+</details>
+
+<details><summary>You run an agent with <code>OTEL_RESOURCE_ATTRIBUTES=deployment.environment.name=staging</code>. What environment do its spans show?</summary>
+
+Still `local`. `run.py` passes `deployment.environment.name=local` to
+`setup_tracing`, and `Resource.create` applies code attributes on top of the
+environment variable. The variable can only add keys the code doesn't set. To
+change the environment, change the code (or stop hard-coding that key).
 </details>
 
 <details><summary>What do the flags <code>03</code> in <code>traceparent</code> mean?</summary>
 
 The flags are two hex digits holding bits. `03` is bits `01` and `02` both set.
-Bit `01` is "sampled": the caller recorded this trace, so a parent-based
-sampler downstream will record it too. Bit `02` is the newer "random" flag
-(W3C Trace Context level 2): the trace id was generated randomly, which lets
-ratio samplers make consistent decisions from it.
+Bit `01` is "sampled": the caller recorded this trace, so a downstream service
+using the default parent-based sampler will record it too
+([module 5](05-sampling.md)). Bit `02` is the newer "random" flag (W3C Trace
+Context level 2): the trace id was generated randomly.
 </details>
 
 <details><summary><code>kb-search-api</code> forgets to call <code>propagate.extract</code>. What does the trace look like?</summary>
 
 The agent's trace still has its `GET /v1/search` client span, but it has no
 child. The API's server span starts with no current span, so it becomes a
-root span with a new trace id: a separate, one-span trace. The query in lab
-step 3 would find no pair for it. You can see this effect with
+root span with a new trace id: a separate, one-span trace. The query in Lab 2
+step 2 would find no pair for it. You can see this effect with
 `STRIP_TRACE_HEADERS=1`, which makes `apis.py` extract from empty headers.
 </details>
 
@@ -744,6 +764,14 @@ without it, the last turn would often be missing.
 No. The library calls the API, and with no SDK tracer provider registered,
 those calls are no-ops. Nothing is recorded or sent.
 </details>
+
+## Next
+
+You now know how one span finds its parent. But who creates the
+`invoke_agent`, `chat` and `execute_tool` spans inside a turn, when LangGraph
+runs the graph and not our code? [Module 2](02-langgraph.md) shows how
+LangChain callbacks are turned into those spans, and where context has to be
+set by hand so HTTP calls get the right parent.
 
 ## Read more
 

@@ -37,7 +37,7 @@ def setup_tracing(service_name: str, attributes: dict[str, str]) -> TracerProvid
     """Register a tracer provider for one process, exporting OTLP over HTTP.
 
     The endpoint comes from OTEL_EXPORTER_OTLP_ENDPOINT. OTEL_RESOURCE_ATTRIBUTES
-    is still merged in, so labels can be overridden without code changes.
+    is still merged in and can add labels, but attributes passed here win over it.
     """
     os.environ.setdefault("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:14318")
     resource = Resource.create({"service.name": service_name, **attributes}, schema_url=SCHEMA_URL)

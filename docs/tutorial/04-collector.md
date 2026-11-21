@@ -1,4 +1,4 @@
-# Module 4: The Collector as a gateway (55 min)
+# Module 4: The Collector as a gateway (50 min)
 
 ## Why this matters
 
@@ -11,29 +11,23 @@ gets lost when the gateway or ClickHouse goes down.
 
 ## Key terms
 
+From [module 1](01-otel-core.md) you need: a **span** (one timed operation),
+a **resource** (the labels saying who produced a span), the **SDK** (the
+library in the app that records and sends spans) and **OTLP** (the
+OpenTelemetry Protocol it sends them with).
+
 | Term | Plain meaning |
 |---|---|
-| **Span** | The record of one timed operation, such as one LLM call or one HTTP request ([module 1](01-otel-core.md)) |
-| **Trace** | All the spans of one request, linked into a tree by a shared trace id |
-| **Attribute** | A key-value label on a span, such as `http.route = /v1/search` |
-| **Resource** | The labels that describe *who* produced a span (service name, owner). The SDK attaches them to every span from that process |
-| **Telemetry** | Data a program emits about itself: traces, metrics and logs |
-| **SDK** | The OpenTelemetry library inside the app that creates spans and sends them out |
-| **OTLP** | OpenTelemetry Protocol: the standard format and wire protocol for sending telemetry |
-| **Backend** | Where telemetry is finally stored and queried. Here, ClickHouse |
 | **Collector** | A separate program that receives telemetry, processes it, and sends it on |
 | **Gateway** | A Collector that runs centrally, and that every app sends to |
 | **Receiver** | The part of a Collector that accepts incoming data |
 | **Processor** | A step that changes, drops, groups or samples data on its way through |
-| **Exporter** | The part that sends data out, for example to ClickHouse |
+| **Exporter** | The part of a Collector that sends data out, for example to ClickHouse |
 | **Pipeline** | One wired-up path: receivers, then processors in order, then exporters |
 | **Extension** | A helper that isn't on the data path, such as a health check endpoint |
-| **Batch** | A group of spans sent together in one request |
-| **Sending queue** | A waiting area in front of an exporter, holding batches until they're sent |
-| **Retry with backoff** | Trying again after a failure, waiting a bit longer each time |
-| **Back-pressure** | Telling senders "slow down, I'm full" instead of silently falling over |
+| **Sending queue** | A waiting area in front of an exporter, holding batches of spans until they're sent |
+| **Back-pressure** | Telling senders "not now, I'm full", so they hold on to data and retry |
 | **OTTL** | OpenTelemetry Transformation Language: short conditions and statements that processors use |
-| **Upsert** | "Update or insert": set the value, overwriting it if it's already there |
 
 ## Idea
 
@@ -46,13 +40,14 @@ agent and the four APIs in this repo:
 - **Every app needs the database address and password.** Rotate the password,
   and you redeploy every app.
 - **Every app needs insert logic.** ClickHouse is happiest with few, large
-  inserts (module 6). Each app would have to batch spans itself.
+  inserts (module 7). Each app would have to batch spans itself.
 - **Every app has to handle outages.** If ClickHouse is down for two minutes,
   each app must hold its spans in memory and retry. Short-lived processes,
   like our agents, often exit before that works.
 - **There's no single place for rules.** "Every span must say which team owns
   it" would have to be enforced in every codebase.
-- **Changing the backend is a huge project.** Moving to a different database
+- **Changing the backend is a huge project.** The backend is where telemetry
+  is finally stored and queried (here, ClickHouse). Moving to a different one
   means touching every app.
 
 A Collector solves this by sitting in the middle. Apps send OTLP to one
@@ -80,8 +75,8 @@ flowchart LR
 The **OpenTelemetry Collector** is a separate program (a single binary, here
 run as a Docker container). It receives telemetry, changes it, and sends it
 on. It isn't part of your app, and it doesn't need to know what language your
-app is written in. It only speaks OTLP (and many other formats, if you add the
-right receivers).
+app is written in. In this repo it accepts only OTLP; other receivers let a
+Collector accept formats such as Prometheus, Jaeger or Zipkin too.
 
 ### The five building blocks
 
@@ -130,10 +125,17 @@ Two things to notice:
 
 ### One span's trip through the gateway
 
-Follow one real request. A user asks the HR agent "I need a new laptop."
-The agent looks up an employee with its `lookup_employee` tool, and the tool
-calls `GET /employees/{employee_id}` on `legacy-hr-api`. That produces, among
-others, these two spans:
+From this module on, the running example changes from the support agent's
+"What is a trace?" to the HR agent's "I need a new laptop." That request
+leaves the agent and crosses into other services (`legacy-hr-api`, then
+`ticket-api`), so it shows what the gateway does with spans from several
+owners.
+
+A user asks the HR agent "I need a new laptop." The agent looks up the
+employee with its `lookup_employee` tool, which calls
+`GET /employees/{employee_id}` on `legacy-hr-api`, and then opens a ticket
+with `create_ticket`, which calls `ticket-api`. Among others, the lookup
+produces these two spans:
 
 - a **client** span from `hr-agent`: "I called the HR API". Its resource has
   `org.owner = people-tech` and `org.service = hr-agent`.
@@ -152,14 +154,16 @@ filter/require_org_    resource has owner and        resource has no owner or se
   labels               service: passes               label: DROPPED here
 resource/org_platform  stamped org.env=dev,
                        org.region=local, ...
-batch                  waits with other spans
-                       (up to 1000, or 5 s)
+batch                  waits with other spans until
+                       1000 are waiting or 5 s pass
 clickhouse exporter    written as one row in
                        otel.otel_traces
 debug exporter         counted in a log line
 ```
 
-You'll see exactly this in the lab.
+The `ticket-api` server span from the same request takes the left-hand path:
+`ticket-api` puts its labels on the resource, so it's kept. You'll see this in
+the lab.
 
 ### OTTL: the condition language
 
@@ -192,14 +196,22 @@ reach ClickHouse: its labels are on the span, not on the resource.
 Sending spans one at a time would mean thousands of tiny network requests and
 thousands of tiny inserts. ClickHouse writes every insert as a new **part** (a
 chunk of files on disk) and merges parts together later in the background
-(module 6). Many tiny inserts mean many tiny parts and a lot of merging.
+(module 7). Many tiny inserts mean many tiny parts and a lot of merging.
 
 The `batch` processor collects spans and sends them as a group when **either**
 1000 spans are waiting **or** 5 seconds have passed, whichever comes first.
 On a quiet system, the 5-second timer usually fires first. On a busy system,
-the 1000-span size does.
+the size does.
 
-### The sending queue, retries and back-pressure
+`send_batch_size: 1000` is a trigger, not a cap. If one app sends 3,000 spans
+in a single request, they leave as one batch of 3,000. Only
+`send_batch_max_size` would split it, and this repo doesn't set it.
+
+Newer Collector versions can also batch inside the exporter's sending queue
+(described next), and the project is moving batching there. This repo still
+uses the `batch` processor.
+
+### When ClickHouse is down: queue, retries and back-pressure
 
 Networks fail and databases restart. The Collector handles that with settings
 that every exporter shares, called the **exporter helper**:
@@ -211,42 +223,49 @@ that every exporter shares, called the **exporter helper**:
 | `sending_queue` | A waiting area between the pipeline and the exporter. Several workers ("consumers") take batches from it and send them | Not set, so the defaults apply: on, in memory, up to 1000 batches, 10 consumers |
 | `sending_queue.storage` | Keep the queue on disk (via a `file_storage` extension), so it survives a restart | Not used |
 
-Here's what happens, step by step, when ClickHouse becomes slow or unreachable:
+Here's the whole story when ClickHouse stops answering:
 
-1. The exporter's sends start failing. Each failed batch is retried with
-   backoff.
-2. New batches keep arriving and pile up in the **sending queue**.
-3. If the queue fills up, new batches can't be added and are dropped.
-4. Meanwhile, the gateway's memory use grows. When it passes the
-   `memory_limiter` threshold, the gateway **refuses new data** from the apps.
-   That's back-pressure: it tells the senders "not now".
-5. The SDK in each app gets that refusal (or a connection error), retries, and
-   holds spans in its own in-memory queue (2048 spans by default in the Python
-   SDK). If that fills up too, or the app exits, those spans are lost.
-6. If ClickHouse comes back within the retry window, the queue drains and
-   nothing is lost. If a batch keeps failing for 300 s, it's dropped.
+1. **The exporter retries.** Each send fails, and the exporter retries that
+   batch with backoff: 5 s, then longer, up to 30 s between tries.
+2. **The queue fills, and the apps don't notice.** The `batch` processor hands
+   each batch to the sending queue and moves on. It doesn't wait for the batch
+   to reach ClickHouse, so the apps' sends to the gateway keep succeeding.
+3. **Two silent drops.** A batch that still fails after 300 s of retries is
+   dropped (counted in `otelcol_exporter_send_failed_spans_total`). Once the queue
+   holds 1000 batches, each new batch is dropped as soon as it arrives
+   (counted in `otelcol_exporter_enqueue_failed_spans_total`). In both cases, nothing
+   is pushed back to the apps: as far as they know, the gateway accepted
+   their spans.
+4. **Only `memory_limiter` pushes back.** If the gateway's memory passes its
+   limit, `memory_limiter` refuses new data at the front door. The receiver
+   answers the app's SDK with a "try again later" error (counted in
+   `otelcol_receiver_refused_spans_total`). That's **back-pressure**. A refusal is
+   not yet a loss: the SDK still has the spans and retries. They're lost only
+   if the SDK gives up, its own queue (2048 spans by default in the Python SDK)
+   fills, or the app exits first.
+5. **ClickHouse comes back.** The consumers drain the queue, and batches that
+   are still inside their 300 s retry window go through.
 
 ```text
 app SDK ──▶ receiver ──▶ memory_limiter ──▶ filter ──▶ resource ──▶ batch ──▶ [ sending queue ] ──▶ exporter ──X  ClickHouse down
-   ▲                          │                                                     │                 │
-   │                          │ memory high:                                        │ fills up        │ retries: 5 s, ..., 30 s
-   │                          │ refuse new data                                     │                 │ gives up after 300 s
-   └──── refusal ─────────────┘                                                                        ▼
-   SDK retries; its own queue fills;                                                            batch is lost
-   spans are lost if it fills or the app exits
+   ▲                          │                                                    │                    │
+   │                          │ memory high:                                       │ full: new batch    │ retries 5 s ... 30 s;
+   └── "try again later" ─────┘ refuse                                             │ dropped silently   │ after 300 s, dropped
+   SDK keeps the spans and retries                                                 ▼ (enqueue_failed)   ▼ (send_failed)
 ```
 
-### Three places data can be lost
+One more case: everything waiting in the `batch` processor and in the sending
+queue lives in memory. **If the gateway restarts or crashes, that data is
+lost**, even if ClickHouse is fine. A queue on disk (`sending_queue.storage`)
+fixes that.
 
-Know all three, because each needs a different fix:
+So data can be lost in three places, each with its own fix:
 
-1. **In the app's SDK.** Its queue is full, or the process exits before it
-   could send. Our agents are short-lived processes, so this matters here.
-2. **In the Collector's memory.** The sending queue is full, the Collector
-   restarts (an in-memory queue is lost on restart), or `memory_limiter`
-   refuses data.
-3. **At the exporter.** The retry window (`max_elapsed_time`, 300 s here) runs
-   out for a batch.
+| Where | How | Fix |
+|---|---|---|
+| The app's SDK | It gives up retrying, its queue fills, or the process exits before sending. Our agents are short-lived, so this matters here | A local Collector agent next to the app, or a longer SDK flush on exit |
+| The gateway's memory | The sending queue is full, or the gateway restarts | A bigger queue, a disk queue, more gateway replicas |
+| The exporter | A batch's 300 s retry window (`max_elapsed_time`) runs out | A longer `max_elapsed_time`, plus a queue big enough to hold that long
 
 ### Distributions: which Collector binary
 
@@ -277,18 +296,17 @@ with the AI agents in this repo.
 - **`${env:ORG_ENV}`** is replaced, when the Collector starts, by the value of
   the `ORG_ENV` environment variable. That's how the same config file can say
   `dev` on a laptop and `prod` in production.
-- **Several `--config` files are merged.** Module 5 turns on tail sampling by
-  passing a second file that adds one processor and restates the pipeline's
-  processor list. When files are merged, maps (key: value sections) are merged
-  together, but lists (like `processors: [...]`) are replaced as a whole.
+- **Several `--config` files are merged.** Module 5 uses this to turn on tail
+  sampling with a second file.
 
 ## Remember it
 
 > **The Collector is a mailroom. Receivers are the in-tray. Processors are
 > the sorting desk, worked in order: check you have room, throw out junk mail,
 > stamp what's left, then bundle it. Exporters are the couriers, and the sending
-> queue is the loading dock. If the couriers can't leave, the dock fills up, and
-> then the mailroom stops accepting letters.**
+> queue is the loading dock. If the couriers can't leave, the dock fills up and
+> new bundles are thrown away. Only the guard at the door (`memory_limiter`)
+> ever tells senders "come back later".**
 
 ## In this repo
 
@@ -325,7 +343,7 @@ processors:
 It refuses new data a little *before* the 512 MiB ceiling. By default, it keeps
 20% headroom, so refusals start around 410 MiB. A refusal goes back to the
 sender as an error, and the SDK retries later. Crashing would lose everything
-in memory; refusing loses nothing yet.
+in memory; refusing loses nothing yet (the SDK still holds the spans).
 
 ```yaml
   batch:
@@ -362,12 +380,24 @@ these labels in `agent/run.py`, and the APIs in `agent/apis.py`, except
 ```
 
 The `resource` processor edits resource labels. Each line sets one label from
-an environment variable, and `upsert` means "set it, and overwrite it if the
-app already sent one". Why should the gateway, not the app, stamp these? An
-app doesn't reliably know which region, cluster or environment it's running
-in, and it might get it wrong. The gateway in each environment knows. So
-**apps set what only they know** (owner, service) and **the platform sets what
-only it knows** (where things run).
+an environment variable, and `upsert` ("update or insert") means "set it, and
+overwrite it if the app already sent one".
+
+But every app already says where it runs: `agent/run.py` and `agent/apis.py`
+set `deployment.environment.name = local` on the resource (module 1). Why a
+second label? Because the two answer different questions:
+
+- `deployment.environment.name` is what the **app believes**. It comes from
+  the app's code or settings, and nothing checks it. A copy-pasted config can
+  say `local` in production.
+- `org.env` is where the span **actually arrived**. Each environment has its
+  own gateway, and that gateway stamps its own value, overwriting anything the
+  app sent. An app can't fake which gateway received its spans.
+
+So `org.env` is the authoritative label, and queries should filter on it
+(`org_env` in ClickHouse), not on `deployment.environment.name`. The same goes
+for region, platform and cluster. **Apps set what only they know** (owner,
+service) and **the platform sets what only it knows** (where things run).
 
 The values come from `compose.yaml`, with these defaults:
 
@@ -414,13 +444,11 @@ Line by line:
 - `create_schema: false`: don't create tables automatically. The tables come
   from `clickhouse/schema.sql`, which the one-off `clickhouse-init` container
   applies before the gateway starts. That way, the table design is under our
-  control (module 10).
-- `timeout`: one insert may take at most 10 seconds.
-- `retry_on_failure`: after a failed insert, wait 5 s and try again. The wait
-  grows each time (by default about 1.5x, with some randomness), up to 30 s
-  between tries. After 300 s of failing, give up on that batch.
-- There's no `sending_queue` block, so the defaults apply: an in-memory queue
-  of up to 1000 batches, drained by 10 consumers.
+  control (module 8).
+- `timeout` and `retry_on_failure`: the settings from the outage story above.
+  The wait between retries grows by about 1.5x each time, with some
+  randomness. There's no `sending_queue` block, so the queue uses its
+  defaults (in memory, 1000 batches, 10 consumers).
 
 ```yaml
   debug:
@@ -515,14 +543,15 @@ shell commands from the repo root. The stack should be running with traffic on
    ORG_ENV=staging docker compose up -d otel-gateway
    sleep 40
    docker exec clickhouse-01 clickhouse-client --password demo -q \
-     "SELECT org_env, org_region, count() FROM otel.otel_traces WHERE Timestamp > now() - INTERVAL 30 SECOND GROUP BY ALL"
+     "SELECT ResourceAttributes['deployment.environment.name'] AS app_says, org_env, org_region, count() FROM otel.otel_traces WHERE Timestamp > now() - INTERVAL 30 SECOND GROUP BY ALL"
    docker compose up -d otel-gateway      # back to dev
    ```
 
    The first command recreates the gateway container with `ORG_ENV=staging`.
-   The query looks at spans from the last 30 seconds. Every new span says
-   `staging`, though no app changed. The last command puts the default (`dev`)
-   back.
+   The query looks at spans from the last 30 seconds. Every new span has
+   `org_env = staging`, though no app changed, while `app_says` is still
+   `local`: the app's own belief, untouched. The last command puts the
+   default (`dev`) back.
 
 3. **Watch batches leave the gateway.** The `debug` exporter logs one line per
    batch:
@@ -533,6 +562,15 @@ shell commands from the repo root. The stack should be running with traffic on
 
    Each line includes a `"spans"` count: how many spans were in that batch.
    With traffic every 30 seconds, you'll see a burst of lines after each round.
+
+   Which trigger sent them, the 5-second timer or the 1000-span size? The
+   gateway counts timer-triggered sends:
+
+   ```bash
+   curl -s localhost:18888/metrics | grep '^otelcol_processor_batch_timeout_trigger_send_total'
+   ```
+
+   On this quiet demo, nearly every batch is sent by the timer.
 
 4. **Break the gateway** and see what the apps lose. With traffic on, stop the
    gateway for 45 seconds, start it again, then look at the traffic loop's log:
@@ -562,9 +600,11 @@ shell commands from the repo root. The stack should be running with traffic on
 
    Turns that ran while the gateway was down are **missing**: there's a gap in
    the buckets. The agents are short-lived processes. They retried, then shut
-   down, and their unsent spans went with them. That's loss in place 1 (the
-   SDK). Compare with module 6, where ClickHouse is down but the gateway is
-   up: there, the gateway's sending queue holds the data and nothing is lost.
+   down, and their unsent spans went with them: loss in the app's SDK, the
+   first row of the table above. Compare with the Keeper lab in
+   [module 7](07-clickhouse.md), where ClickHouse can't take inserts but the
+   gateway is up: there, the sending queue and retries hold the data, and
+   nothing is lost if Keeper returns within 300 s.
 
 ## Explain it back
 
@@ -572,11 +612,8 @@ shell commands from the repo root. The stack should be running with traffic on
 > send it OTLP and don't need to know anything about ClickHouse. Our gateway
 > receives OTLP, protects itself with a memory limiter, drops spans whose
 > resource lacks owner and service labels, stamps platform labels from its own
-> environment, batches, and writes to ClickHouse. Exporters have a sending
-> queue and retries with backoff, so a backend outage of a few minutes is
-> absorbed. The queue is in memory, though, so a gateway restart loses it, and
-> when the gateway itself is down, the SDKs only retry briefly. For more
-> safety, you'd add a persistent queue or a local agent collector."
+> environment, batches, and writes to ClickHouse through a sending queue with
+> retries."
 
 ## Recap
 
@@ -587,9 +624,10 @@ shell commands from the repo root. The stack should be running with traffic on
 - Order: `memory_limiter` first, filters early, `batch` last.
 - The filter drops spans whose **resource** lacks `org.owner` or
   `org.service`. The resource processor stamps `org.region`, `org.platform`,
-  `org.cluster` and `org.env` from the gateway's environment.
-- The sending queue and retries absorb short backend outages. Data can still
-  be lost in the SDK, in the Collector's memory, or when retries run out.
+  `org.cluster` and `org.env` from the gateway's environment. Query by
+  `org.env`, not the app's own `deployment.environment.name`.
+- Only `memory_limiter` pushes back on apps. A full sending queue or an
+  expired retry drops data silently.
 
 ## Check yourself
 
@@ -602,17 +640,21 @@ batching earlier wastes work and makes batches uneven.
 
 <details><summary>Should a service set <code>org.env</code> itself?</summary>
 
-No. Where something runs is a fact about the platform, so the gateway in that
-environment stamps it (`upsert` overwrites whatever the app sent). Apps set
-what only they know: owner and service.
+It may set `deployment.environment.name`, as every app here does (`local`),
+but that's only what the app believes. Where a span really arrived is a fact
+about the platform, so the gateway in that environment stamps `org.env`
+(`upsert` overwrites whatever the app sent). Queries should use `org.env`.
 </details>
 
-<details><summary>ClickHouse is down for 10 minutes. What's lost?</summary>
+<details><summary>ClickHouse is down for 10 minutes. What's lost, and do the apps find out?</summary>
 
-With `max_elapsed_time: 300s`, batches that can't be written within 5 minutes
-are dropped, and while the queue is full, new data is refused. You'd raise
-`max_elapsed_time`, size the queue, and use `sending_queue.storage` with a
-`file_storage` extension to survive longer outages and restarts.
+Batches still failing after 300 s (`max_elapsed_time`) are dropped
+(`send_failed`). Once the queue holds 1000 batches, new ones are dropped on
+arrival (`enqueue_failed`). The apps don't find out: the `batch` processor
+already accepted their spans, so their sends keep succeeding. Only if gateway
+memory passes the `memory_limiter` limit are apps refused, and then their SDKs
+retry. To survive longer, raise `max_elapsed_time`, size the queue, and put it
+on disk with `sending_queue.storage`, which also survives a gateway restart.
 </details>
 
 <details><summary>A new service sends <code>org.owner</code> on its resource but forgets <code>org.service</code>. What happens to its spans?</summary>
@@ -636,6 +678,12 @@ So it's in one place. Rotating it, or moving to a different backend, means
 changing one config instead of redeploying every app. Apps only need the
 gateway's OTLP address.
 </details>
+
+## Next
+
+The gateway now stores every span it's sent. [Module 5](05-sampling.md) asks
+whether it should: how to keep only some traces without losing the ones you
+need, and where in this pipeline that decision can be made.
 
 ## Read more
 

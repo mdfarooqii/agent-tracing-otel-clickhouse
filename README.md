@@ -4,7 +4,7 @@ A runnable demo of tracing a fleet of LangGraph agents with the OpenTelemetry SD
 
 [![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/mdfarooqii/agent-tracing-otel-clickhouse?quickstart=1)
 
-New to OpenTelemetry, LangGraph or ClickHouse? The [5-hour tutorial](docs/tutorial/README.md) explains every layer of this repo, with hands-on labs that break it on purpose.
+New to OpenTelemetry, LangGraph or ClickHouse? The [two-part tutorial](docs/tutorial/README.md) explains every layer of this repo, with hands-on labs that break it on purpose.
 
 ## Try it in your browser
 
@@ -173,7 +173,7 @@ The APIs deliberately send different label sets, so you can see each case in the
 [`clickhouse/schema.sql`](clickhouse/schema.sql) extends the stock OTel ClickHouse exporter table, so existing tools that read `otel_traces` keep working:
 
 - **`otel_traces`**: one row per span. Every `org.*` label and core `gen_ai.*` attribute is also a real column (`org_owner`, `gen_ai_agent_name`, `gen_ai_tokens_in` and so on), filled automatically on insert. Request, tenant and conversation ids have bloom-filter indexes. Raw spans are kept for 72 hours.
-- **`trace_entry`**: one row per trace, for looking up a trace by request id, tenant or interface.
+- **`trace_entry`**: one row per request (read it with `FINAL`), led by the request's root span, for looking up a trace by request id, tenant or interface.
 - **`span_red_1m`**: per-minute calls, errors and p50/p95/p99 latency per service and operation, kept for a year.
 
 All tables are replicated across both ClickHouse nodes.
@@ -198,7 +198,7 @@ agent/
   simulate.py         Starts the APIs and runs all agents, once or in a loop
 clickhouse/           Cluster, Keeper and macros config, the schema, the /play redirect
 compose.yaml          ClickHouse Keeper, two ClickHouse replicas, schema init, OTel gateway
-docs/tutorial/        The 5-hour tutorial and its lab files
+docs/tutorial/        The two-part tutorial and its lab files
 otel-gateway-config.yaml
 queries.sql           Saved queries: turns, agents, tools, errors, dependencies, span tree
 stack.sh              up / down / status / demo / queries / logs / traffic

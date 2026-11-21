@@ -1,4 +1,4 @@
-# Module 3: GenAI semantic conventions (45 min)
+# Module 3: GenAI semantic conventions (50 min)
 
 ## Why this matters
 
@@ -21,38 +21,33 @@ What you'll be able to do after this module:
 
 ## Key terms
 
+Spans, traces, attributes, resources and span kinds (`CLIENT`, `SERVER`,
+`INTERNAL`) were covered in [module 1](01-otel-core.md); tokens, tools and
+agents in [module 2](02-langgraph.md). These are the new words.
+
 | Term | Plain meaning |
 |---|---|
-| Span | The record of one timed operation, with a name, a start, an end and attributes ([module 1](01-otel-core.md)). |
-| Trace | All the spans of one request, linked into a tree by a shared trace id. |
-| Attribute | A key-value label on a span, such as `gen_ai.request.model = fake-writer`. |
-| Resource | Labels that describe *who* produced the spans (service name, owner). The SDK adds them to every span from that process. |
-| Semantic conventions (semconv) | OpenTelemetry's shared dictionary of span names, attribute names and allowed values for common kinds of work. |
+| Semantic conventions (semconv) | OpenTelemetry's shared dictionary of span names, attribute names and allowed values for common kinds of work. The **GenAI** part covers generative AI: models that produce text from a prompt, and the agents built on them. |
 | Namespace | The prefix of an attribute name, such as `gen_ai.` or `http.`. It groups related names and prevents clashes. |
-| GenAI | Generative AI: models that produce text (or images, audio) from a prompt, and the agents built on them. |
 | Operation name | The attribute `gen_ai.operation.name`. It says what kind of GenAI work a span records: `chat`, `invoke_agent`, `execute_tool`, `invoke_workflow` and a few others. |
-| Span kind | A field on every span saying its role: `CLIENT` (I called something outside my process), `SERVER` (I answered a call), `INTERNAL` (work inside my process). |
 | Schema URL | A web address that names the exact version of the conventions a piece of telemetry follows. |
 | Stability level | How settled a part of the conventions is. *Stable* names won't change; *development* names may. |
 | Provider | Who serves the model, for example a model vendor's API. Here it's the fake model, reported as `fakechatmodel`. |
-| Token | The unit a model reads and writes, roughly a word or part of a word. Providers charge per token. |
 | Prompt cache | A provider feature that remembers a prompt prefix it has seen before. Reused tokens are cheaper. |
 | Finish reason | Why the model stopped writing, for example `stop` (it finished normally) or because it hit a length limit. |
-| Turn | One user message and the agent's complete answer to it. In this repo, one turn is one trace. |
 | Session, conversation | A series of turns with one user, tied together by `gen_ai.conversation.id`. |
 | Eval (evaluation) | A score of answer *quality* (correct, safe, helpful), usually produced after the turn. |
-| Materialized column | A ClickHouse column that's computed automatically from other columns when a row is inserted. |
 
 ## Idea
 
 ### The running example
 
-We'll follow the same request as module 2. A user of the **support agent**
-asks: *"What does the collector do?"* The supervisor routes to the
-researcher, the researcher searches the knowledge base and summarizes, the
-supervisor routes to the writer, the writer drafts an answer and counts its
-words, and the supervisor finishes. That's 5 agent steps, 5 LLM calls and 2
-tool calls, all inside one trace.
+We'll follow the same request as modules 0 to 2. A user of the **support
+agent** asks *"What is a trace?"*, the first turn of a new conversation. The
+supervisor routes to the researcher, the researcher searches the knowledge
+base and summarizes, the supervisor routes to the writer, the writer drafts
+an answer and counts its words, and the supervisor finishes. That's 5 agent
+steps, 5 LLM calls and 2 tool calls, all inside one trace.
 
 Every attribute in this module is shown on a span from that request.
 
@@ -132,7 +127,8 @@ conventions, exactly as the `gen_ai.*` names come from the GenAI conventions.
    say `gen_ai.agent.role`, a future release might define that exact name
    with a different meaning. That's why this repo puts its own labels under
    `org.*` (`org.tenant`, `org.agent.role`, `org.agent.turn.index`, and the
-   owner and service labels from [module 4](04-collector.md)). No official
+   `org.owner` and `org.service` labels from [module 0](00-setup.md) and
+   [module 1](01-otel-core.md#resource-who-produced-the-spans)). No official
    name will ever start with `org.`, so they can't collide.
 
 ### The four operations this repo uses
@@ -218,14 +214,17 @@ step number). These are the repo's own labels, in its own namespace.
 
 ### One request, span by span
 
-Here is the real trace of our request, as stored in ClickHouse. It was turn 5
-of a support-agent conversation for the tenant `globex`. Ids are shortened, and
-`org.tenant = globex` (on every agent span) is left out to save space.
+Here is the real trace of our request, as stored in ClickHouse: turn 1 of a
+support-agent conversation for the tenant `globex`. Ids are shortened, and
+`org.tenant = globex` (on every agent span) is left out to save space. Every
+turn 1 of the support agent asks the same question and gets the same canned
+replies, so the token numbers below are the same in every turn-1 trace (lab
+step 1 finds one for you).
 
 ```text
 agent_turn                                   INTERNAL   created by run.py
   gen_ai.conversation.id   = 1b531786-...
-  org.agent.turn.index     = 5
+  org.agent.turn.index     = 1
   org.agent.interface      = slack
 │
 └── invoke_workflow support_supervisor       INTERNAL
@@ -240,7 +239,7 @@ agent_turn                                   INTERNAL   created by run.py
     │     gen_ai.agent.version   = 0.1.0
     │     gen_ai.conversation.id = 1b531786-...
     │     org.agent.role         = supervisor
-    │     org.agent.step         = 25
+    │     org.agent.step         = 1
     │   │
     │   └── chat fake-supervisor             CLIENT
     │         gen_ai.operation.name               = chat
@@ -249,29 +248,29 @@ agent_turn                                   INTERNAL   created by run.py
     │         gen_ai.request.model                = fake-supervisor
     │         gen_ai.response.model               = fake-supervisor
     │         gen_ai.response.finish_reasons      = ["stop"]
-    │         gen_ai.usage.input_tokens           = 13
+    │         gen_ai.usage.input_tokens           = 12
     │         gen_ai.usage.cache_read.input_tokens = 8
     │         gen_ai.usage.output_tokens          = 1
     │         gen_ai.conversation.id              = 1b531786-...
     │
-    ├── invoke_agent researcher              INTERNAL   (agent.id = support_supervisor.researcher, role = worker, step 26)
+    ├── invoke_agent researcher              INTERNAL   (agent.id = support_supervisor.researcher, role = worker, step 2)
     │   ├── execute_tool search_knowledge_base   INTERNAL
     │   │     gen_ai.operation.name = execute_tool
     │   │     gen_ai.agent.name     = researcher
     │   │     gen_ai.tool.name      = search_knowledge_base
     │   │     gen_ai.tool.type      = function
     │   │   └── GET /v1/search  (client, then the kb-search-api server span: HTTP conventions, no gen_ai.*)
-    │   └── chat fake-researcher             CLIENT     input 23, cache_read 6, output 14
+    │   └── chat fake-researcher             CLIENT     input 26, cache_read 6, output 18
     │
-    ├── invoke_agent supervisor              INTERNAL   step 27
-    │   └── chat fake-supervisor             CLIENT     input 13, cache_read 8, output 1
+    ├── invoke_agent supervisor              INTERNAL   step 3
+    │   └── chat fake-supervisor             CLIENT     input 12, cache_read 8, output 1
     │
-    ├── invoke_agent writer                  INTERNAL   (agent.id = support_supervisor.writer, role = worker, step 28)
-    │   ├── chat fake-writer                 CLIENT     input 21, cache_read 7, output 15
+    ├── invoke_agent writer                  INTERNAL   (agent.id = support_supervisor.writer, role = worker, step 4)
+    │   ├── chat fake-writer                 CLIENT     input 25, cache_read 7, output 19
     │   └── execute_tool count_words         INTERNAL   tool.name = count_words, tool.type = function
     │
-    └── invoke_agent supervisor              INTERNAL   step 29
-        └── chat fake-supervisor             CLIENT     input 13, cache_read 8, output 1
+    └── invoke_agent supervisor              INTERNAL   step 5
+        └── chat fake-supervisor             CLIENT     input 12, cache_read 8, output 1
 ```
 
 How to read it:
@@ -281,7 +280,7 @@ How to read it:
 - **Identity lives on `invoke_agent`.** Name, id and version say *which*
   agent ran, and which release of its code.
 - **Money lives on `chat`.** Only chat spans have tokens. The supervisor reads
-  13 tokens and writes just 1: its reply is a single routing word such as
+  12 tokens and writes just 1: its reply is a single routing word such as
   `researcher` or `FINISH`.
 - **Actions live on `execute_tool`.** The tool name says what the agent *did*.
   The HTTP spans below it use the HTTP conventions instead, because they're
@@ -289,10 +288,10 @@ How to read it:
 - **The conversation id appears on the root span and on all workflow, agent
   and chat spans.** That's what ties this turn to the other turns of the same
   conversation.
-- **`org.agent.step` is 25 to 29, not 1 to 5.** LangGraph's checkpointer
-  saves the conversation's state between turns, and the step counter keeps
-  going from where the last turn stopped. This is turn 5, so the counter has
-  already moved on.
+- **`org.agent.step` is 1 to 5** because this is the first turn. On later
+  turns of the same conversation the numbers keep climbing, because LangGraph's
+  checkpointer carries the step counter over
+  ([module 2](02-langgraph.md#under-the-hood-steps-and-the-checkpointer)).
 
 Where do these values come from? The tracer reads them from what LangChain
 hands its callbacks: the model name from the `ls_model_name` metadata, the
@@ -321,20 +320,28 @@ the same system message ("Route the turn to researcher, writer, or FINISH.").
 A provider with a prompt cache recognizes that repeated beginning and charges
 less for it. The fake model imitates this: it reports the system message's
 words as cached. That's why the supervisor's chat span says
-`input_tokens = 13` and `cache_read.input_tokens = 8`: 8 words of system
-message plus 5 words of question.
+`input_tokens = 12` and `cache_read.input_tokens = 8`: 8 words of system
+message plus the 4 words of "What is a trace?".
 
 Two important rules:
 
 1. **Cached tokens are part of the input, not extra.** `cache_read = 8` means
-   "8 of the 13 input tokens came from the cache". Don't add them together.
+   "8 of the 12 input tokens came from the cache". Don't add them together.
 2. **Tokens live on `chat` spans only.** To get the total for an agent, a
    turn or a conversation, *sum* the chat spans below it. Never copy totals
    onto the parent `invoke_agent` or `agent_turn` span. If you did, any query
    that sums tokens over a trace would count them twice.
 
-For our request, summing the five chat spans gives 83 input tokens (37 of
-them cached) and 32 output tokens. That sum is a query, not an attribute (lab
+> **Watch out with real providers.** Providers don't agree on whether their
+> own "input tokens" figure already includes the cached tokens. Some report
+> one total with the cached part inside it; others report cached tokens as a
+> separate number next to a smaller "input" figure. The conventions ask for
+> `gen_ai.usage.input_tokens` to be the full input, cached tokens included,
+> so instrumentation for the second kind of provider has to add the parts
+> together. Check your provider's usage fields before trusting a cache ratio.
+
+For our request, summing the five chat spans gives 87 input tokens (37 of
+them cached) and 40 output tokens. That sum is a query, not an attribute (lab
 step 3).
 
 In this repo the fake model reports **word counts as token counts** (see
@@ -349,9 +356,9 @@ experiences the agent.
 
 ```text
 Session / conversation   gen_ai.conversation.id = 1b531786-...   many turns, minutes to days
-├── Turn 1   one trace, root span agent_turn
-├── Turn 2   another trace
-└── Turn 3   another trace
+├── Turn 1   one trace, root span agent_turn   "What is a trace?"
+├── Turn 2   another trace                     "What does the collector do?"
+└── Turn 3   another trace                     "How does ClickHouse keep replicas in sync?"
     Evals: scores attached later to a turn or a chat span ("was this answer good?")
 ```
 
@@ -360,7 +367,8 @@ repo, **one turn is one trace**, rooted at the `agent_turn` span that
 `run.py` creates. A turn has a clear start and end, so it can be timed,
 sampled and debugged as a unit. Each turn also gets its own
 `org.agent.turn.id` and `org.agent.turn.index` (1, 2, 3, ...) on the
-`agent_turn` span.
+`agent_turn` span. The background traffic runs three turns per conversation
+(`TRAFFIC_TURNS=3` in `stack.sh`).
 
 **Session (conversation).** A series of turns with one user. The conventions
 call its id `gen_ai.conversation.id`. `run.py` creates one random id per run
@@ -389,14 +397,16 @@ correct, grounded in the notes, safe, helpful? They're usually produced
 - a **rule** (for example "the answer must mention a ticket id"),
 - a **user's feedback**, such as a thumbs-up.
 
-An eval is attached to the span it judges, using that span's trace id and span
-id. The conventions define attributes for it: `gen_ai.evaluation.name` (what
-was judged, such as "relevance"), `gen_ai.evaluation.score.value` (a number),
-`gen_ai.evaluation.score.label` (a word, such as "pass") and
-`gen_ai.evaluation.explanation` (why). **This repo doesn't produce evals
-yet.** Adding them would mean a job that reads finished turns, scores them,
-and writes rows keyed by `TraceId` (and `SpanId`), so queries can join scores
-to traces.
+The GenAI conventions record an eval as an **event** named
+`gen_ai.evaluation.result`: a timestamped record, sent as an OpenTelemetry
+log record, that carries the trace id and span id of the span it judges. The
+event carries
+`gen_ai.evaluation.name` (what was judged, such as "relevance"),
+`gen_ai.evaluation.score.value` (a number), `gen_ai.evaluation.score.label`
+(a word, such as "pass") and `gen_ai.evaluation.explanation` (why). **This
+repo doesn't produce evals yet.** Adding them would mean a job that reads
+finished turns, scores them, and emits `gen_ai.evaluation.result` events
+keyed by `TraceId` and `SpanId`, so queries can join scores to traces.
 
 ### Content is opt-in
 
@@ -415,8 +425,9 @@ tracing code for a framework) usually turn them on with a setting such as
 **In this repo.** The tracer never records content. Its docstring says so:
 "Prompt, completion and tool content is never recorded." You can confirm it in
 the trace above: there's no `gen_ai.input.messages` anywhere. (The HTTP client
-span's `url.full` does include the search query string, because it's a URL.
-That's the HTTP conventions at work, not the GenAI ones.)
+span's `url.full` does include the search query string,
+`...?q=What+is+a+trace%3F`, because it's a URL. That's the HTTP conventions
+at work, not the GenAI ones.)
 
 ### GenAI metrics
 
@@ -450,45 +461,61 @@ pin the schema version.
 - `agent/graph.py`: `FakeChatModel` fills in `usage_metadata` (input, output
   and cache-read tokens) and `response_metadata` (model name, finish reason),
   shaped like a real provider's reply.
-- `clickhouse/schema.sql`: spans are stored with all their attributes in one
-  `SpanAttributes` column, a **map** (a column that holds a whole dictionary
-  of key-value pairs per row). For the most queried GenAI attributes, the
-  table also defines `gen_ai_*` **MATERIALIZED columns**. ClickHouse fills
-  them in automatically at insert time by copying a value out of the map:
-
-  ```sql
-  gen_ai_operation   LowCardinality(String) MATERIALIZED SpanAttributes['gen_ai.operation.name'],
-  gen_ai_tokens_in   UInt32 MATERIALIZED toUInt32OrZero(SpanAttributes['gen_ai.usage.input_tokens']),
-  ```
-
-  Line by line: `gen_ai_operation` is a string column (`LowCardinality` tells
-  ClickHouse there are only a few distinct values, so it can store them
-  compactly). Its value is the map's `gen_ai.operation.name` entry.
-  `gen_ai_tokens_in` turns the map's text value into a number;
-  `toUInt32OrZero` gives `0` when the attribute is missing, as it is on
-  non-chat spans.
-
-  Why bother? Reading `SpanAttributes['...']` means reading the whole map
-  column for every row. A real column is small, compressed on its own, and
-  can be indexed, so queries on it are much faster
-  ([module 6](06-clickhouse.md) explains how ClickHouse stores columns). The
-  full list includes `gen_ai_provider`, `gen_ai_request_model`,
-  `gen_ai_response_model`, `gen_ai_finish_reasons`, `gen_ai_conversation_id`
-  (with a bloom filter index for fast lookups by id), `gen_ai_agent_name`,
-  `gen_ai_agent_id`, `gen_ai_agent_version`, `gen_ai_tool_name`,
-  `gen_ai_tool_type`, `gen_ai_tokens_out`, `gen_ai_tokens_cache_read` and
-  `gen_ai_tokens_reasoning`.
+- `clickhouse/schema.sql`: every attribute is stored in the `SpanAttributes`
+  map column of `otel.otel_traces`, the table the gateway writes to. The
+  table also keeps a fast copy of the most-queried GenAI attributes as their
+  own columns, such as `gen_ai_operation`, `gen_ai_agent_name` and
+  `gen_ai_tokens_in`, filled in automatically from the map. The lab uses
+  them; [module 8](08-data-model.md) explains how they work.
 - `queries.sql`: queries 2, 3, 4 and 5 group and filter by
   `gen_ai.operation.name` and `gen_ai.agent.name`, for example per-agent
   latency and the agent hand-off path per turn.
 
-## Lab (10 min)
+## Lab (15 min)
 
 Run SQL in <http://localhost:8123/play> (user `default`, password `demo`).
 The stack should be running with traffic on (`./stack.sh up`), so there are
 spans from all three agent services.
 
-1. Which attributes does each operation actually carry? This query takes every
+1. Find a turn-1 trace like the one above. The `WITH` line picks the most
+   recent support-agent `agent_turn` span whose turn index is 1; the main
+   query lists that trace's support-agent spans with their step and tokens:
+
+   ```sql
+   WITH (SELECT TraceId FROM otel.otel_traces
+         WHERE ServiceName = 'support-agent' AND SpanName = 'agent_turn'
+           AND SpanAttributes['org.agent.turn.index'] = '1'
+         ORDER BY Timestamp DESC LIMIT 1) AS t
+   SELECT SpanName, SpanAttributes['org.agent.step'] AS step,
+          gen_ai_tokens_in AS tokens_in, gen_ai_tokens_cache_read AS cached,
+          gen_ai_tokens_out AS tokens_out
+   FROM otel.otel_traces WHERE TraceId = t AND ServiceName = 'support-agent'
+   ORDER BY Timestamp;
+   ```
+
+   ```text
+   agent_turn                                    0   0   0
+   invoke_workflow support_supervisor            0   0   0
+   invoke_agent supervisor              1        0   0   0
+   chat fake-supervisor                         12   8   1
+   invoke_agent researcher              2        0   0   0
+   execute_tool search_knowledge_base            0   0   0
+   GET /v1/search                                0   0   0
+   chat fake-researcher                         26   6  18
+   invoke_agent supervisor              3        0   0   0
+   chat fake-supervisor                         12   8   1
+   invoke_agent writer                  4        0   0   0
+   chat fake-writer                             25   7  19
+   execute_tool count_words                      0   0   0
+   invoke_agent supervisor              5        0   0   0
+   chat fake-supervisor                         12   8   1
+   ```
+
+   What to notice: only `chat` rows have tokens (the token columns read `0`
+   when the attribute is missing), and only `invoke_agent` rows have a step.
+   To see every attribute of one span, select `SpanAttributes` instead.
+
+2. Which attributes does each operation actually carry? This query takes every
    GenAI span, collects all the attribute keys seen for each operation, and
    prints one sorted list per operation:
 
@@ -508,9 +535,22 @@ spans from all three agent services.
    what's *missing*: no `gen_ai.tool.call.id`, and no `gen_ai.conversation.id`
    on `execute_tool`.
 
-2. Tokens and cache hit ratio by agent. This query looks only at chat spans,
-   and for each service and agent counts the calls and sums the tokens. The
-   cache ratio is "what share of input tokens came from the cache":
+3. Tokens per turn, and cache hit ratio by agent. First, sum the chat spans
+   of each trace; remember, one trace is one turn:
+
+   ```sql
+   SELECT ServiceName, TraceId, sum(gen_ai_tokens_in + gen_ai_tokens_out) AS tokens
+   FROM otel.otel_traces WHERE gen_ai_operation = 'chat'
+   GROUP BY ServiceName, TraceId ORDER BY tokens DESC LIMIT 5;
+   ```
+
+   This is the "sum, don't copy" rule in action: the turn total is computed
+   from the chat spans, not stored on `agent_turn`. Support-agent turns
+   usually top the list, because they make five LLM calls each. (A
+   successful turn 1 always comes to 87 + 40 = 127.)
+
+   Then, for each service and agent, count the chat calls and sum the tokens.
+   The cache ratio is "what share of input tokens came from the cache":
 
    ```sql
    SELECT ServiceName, gen_ai_agent_name, count() AS calls,
@@ -524,19 +564,6 @@ spans from all three agent services.
    word); the writer writes the most. That's the kind of insight these
    attributes are for. The query can group by agent directly because the
    tracer puts `gen_ai.agent.name` on chat spans.
-
-3. Tokens per turn. Sum the chat spans of each trace; remember, one trace is
-   one turn:
-
-   ```sql
-   SELECT ServiceName, TraceId, sum(gen_ai_tokens_in + gen_ai_tokens_out) AS tokens
-   FROM otel.otel_traces WHERE gen_ai_operation = 'chat'
-   GROUP BY ServiceName, TraceId ORDER BY tokens DESC LIMIT 5;
-   ```
-
-   This is the "sum, don't copy" rule in action: the turn total is computed
-   from the chat spans, not stored on `agent_turn`. Support-agent turns
-   usually top the list, because they make five LLM calls each.
 
 4. One session, turn by turn (each turn is its own trace). The `WITH` line
    picks any one support-agent conversation id. The main query then lists every
@@ -556,9 +583,10 @@ spans from all three agent services.
    What to notice: several different trace ids share one conversation id;
    that's the session. `turn_ms` is the longest span in the trace, which is
    the `agent_turn` root (`Duration` is in nanoseconds, so dividing by `1e6`
-   gives milliseconds). The background traffic runs the support agent with
-   `--fail-turn 2`, so the second turn usually shows `failed = 1` and a much
-   shorter time: it stopped at the failed search.
+   gives milliseconds). The first row is turn 1, *"What is a trace?"*. The
+   background traffic runs the support agent with `--fail-turn 2`, so the
+   second turn usually shows `failed = 1` and a much shorter time: it stopped
+   at the failed search.
 
 ## Explain it back
 
@@ -585,14 +613,13 @@ spans from all three agent services.
 - Identity on agent spans, tokens on chat spans, actions on tool spans. This
   repo also copies `gen_ai.agent.name` onto chat and tool spans for easy
   grouping.
-- Tokens are stored once, on chat spans. Cached tokens are part of the input.
-  Totals for agents, turns and sessions are sums in queries.
+- Tokens are stored once, on chat spans. Cached tokens are part of the input,
+  though providers differ in how they report them. Totals for agents, turns
+  and sessions are sums in queries.
 - One turn is one trace; a session is all the traces sharing a
-  `gen_ai.conversation.id`; evals are quality scores attached later by trace
-  and span id.
+  `gen_ai.conversation.id`; evals are `gen_ai.evaluation.result` events
+  attached later by trace and span id.
 - Prompts and answers are not recorded by default, and never in this repo.
-- In ClickHouse, the hottest attributes are copied into `gen_ai_*`
-  materialized columns for fast queries.
 
 ## Check yourself
 
@@ -631,9 +658,9 @@ Make each turn a trace, and link the turns through `gen_ai.conversation.id`.
 <details><summary>An LLM judge scores an answer an hour after the turn. How does the score find its trace?</summary>
 
 The judge reads the finished turn, so it knows the trace id and the span id
-of the turn or chat span. It records the result with `gen_ai.evaluation.*`
-attributes, keyed by those ids. A query can then join scores to traces on
-`TraceId`.
+of the turn or chat span. It emits a `gen_ai.evaluation.result` event tied to
+those ids, with the `gen_ai.evaluation.*` attributes (name, score, label,
+explanation). A query can then join scores to traces on `TraceId`.
 </details>
 
 <details><summary>Why put tokens on chat spans, and not on the agent span too?</summary>
@@ -647,6 +674,9 @@ fact once, on the span where it happened, and aggregate in queries.
 `gen_ai.usage.input_tokens = 1000` and
 `gen_ai.usage.cache_read.input_tokens = 800`. The cache figure is a breakdown
 of the input, not an addition; cost models price the two parts differently.
+If the provider instead reported "200 input, 800 cached" as separate numbers,
+you'd still record 1,000 as the input, because the conventions want the full
+input count.
 </details>
 
 <details><summary>You want to add a "customer tier" label to every agent span. What do you call it?</summary>
@@ -664,12 +694,20 @@ a small, reasonable change. That's what "development" status means in practice:
 check what the current version offers.
 </details>
 
+## Next
+
+You now know what the spans say. [Module 4](04-collector.md) answers how they
+get from the agent to ClickHouse: through the OpenTelemetry Collector, the
+gateway in the middle that checks, labels and batches every span, and
+decides what's lost when something goes down.
+
 ## Read more
 
 - [Semantic conventions overview](https://opentelemetry.io/docs/specs/semconv/)
 - [GenAI semantic conventions](https://opentelemetry.io/docs/specs/semconv/gen-ai/)
 - [GenAI spans](https://opentelemetry.io/docs/specs/semconv/gen-ai/gen-ai-spans/)
 - [GenAI agent and framework spans](https://opentelemetry.io/docs/specs/semconv/gen-ai/gen-ai-agent-spans/)
+- [GenAI events (including evaluation results)](https://opentelemetry.io/docs/specs/semconv/gen-ai/gen-ai-events/)
 - [GenAI metrics](https://opentelemetry.io/docs/specs/semconv/gen-ai/gen-ai-metrics/)
 - [GenAI attribute registry](https://opentelemetry.io/docs/specs/semconv/registry/attributes/gen-ai/)
 - [Schemas and schema URLs](https://opentelemetry.io/docs/specs/otel/schemas/)

@@ -1,9 +1,11 @@
-# Module 6: ClickHouse storage, replicas and Keeper (45 min)
+# Module 7: ClickHouse storage, replicas and Keeper (40 min)
 
 ## Why this matters
 
 Every span the agents produce ends up as a row in ClickHouse, the database
-this repo uses to store traces. To understand why queries are fast, why
+this repo uses to store traces. [Module 6](06-cross-environment.md) showed
+how spans from many services and environments land in one table. This module
+looks inside that table. To understand why queries are fast, why
 the gateway sends spans in batches, and what breaks when a server goes
 down, you need a picture of how ClickHouse writes data to disk and how
 it keeps two copies in sync.
@@ -20,25 +22,23 @@ it keeps two copies in sync.
 
 ## Key terms
 
+Reminder: **cardinality** is how many distinct values a field has
+([module 1](01-otel-core.md)). `SpanKind` has a handful (low); `TraceId` has
+millions (high).
+
 | Term | Plain meaning |
 |---|---|
-| Column-oriented database (column store) | A database that stores each column in its own file, instead of storing whole rows together |
-| Table engine | The part of ClickHouse that decides how a table's data is stored on disk. `MergeTree` is the main one |
-| MergeTree | ClickHouse's main table engine: data arrives in small sorted chunks that are merged in the background |
-| Part | One immutable (never edited) chunk of a table on disk. Every insert creates a new part |
-| Merge | A background job that combines several small parts into one bigger part |
+| Column store | A database that stores each column in its own file, instead of storing whole rows together |
+| MergeTree | ClickHouse's main table engine (the part that decides how data is stored): data arrives in small sorted chunks that are merged in the background |
+| Part / merge | A part is one immutable (never edited) chunk of a table on disk; every insert creates one. A merge combines small parts into a bigger one |
 | Sorting key (`ORDER BY`) | The columns a table's rows are sorted by inside each part |
-| Primary key / sparse index | A small index with one entry per 8192 rows, used to skip data that can't match a filter |
-| Granule | A block of 8192 rows: the smallest unit ClickHouse reads |
-| Mark | One index entry, pointing to the start of one granule |
-| Cardinality | How many distinct values a column has. `SpanKind` has a handful (low); `TraceId` has millions (high) |
+| Sparse primary index | One index entry (a **mark**) per **granule** of 8192 rows, used to skip granules that can't match a filter |
 | Partition | A group of parts for one value of the partition key; here, one day of spans |
 | TTL (time to live) | A rule that deletes data automatically once it reaches a certain age |
 | Materialized view | A trigger that runs a query on every insert and writes the result to another table |
 | Replica | A full copy of a table on another server |
 | ClickHouse Keeper | A small coordination service that replicas use to agree on which parts exist. It stores no span data |
-| Raft, quorum | The voting method Keeper uses: a change counts only once a majority (the quorum) of Keeper servers has saved it |
-| Macro | A per-server variable in ClickHouse config, like `{replica}` = `clickhouse-01` |
+| Quorum | A majority of Keeper servers; a change counts only once a quorum has saved it |
 
 ## Idea
 
@@ -93,7 +93,7 @@ Every ClickHouse table has a **table engine**, which decides how its data
 is stored. Almost every real table uses the **MergeTree** family. Variants
 add behavior on top: `ReplicatedMergeTree` keeps copies on several servers,
 `ReplacingMergeTree` removes duplicate rows, `AggregatingMergeTree` keeps
-running totals. This repo uses all three (module 10 walks through each
+running totals. This repo uses all three (module 8 walks through each
 table).
 
 ### Parts and background merges
@@ -160,6 +160,19 @@ Rows are sorted by owner team first, then service within each owner, then
 span name, then time (to the second). So all `people-tech` / `hr-agent` /
 `agent_turn` rows sit next to each other.
 
+Where do `org_owner` and `org_service` come from? The gateway doesn't send
+them as columns; it sends the resource labels inside the `ResourceAttributes`
+map. The table fills these columns **automatically on insert** from
+`ResourceAttributes['org.owner']` and `ResourceAttributes['org.service']`.
+They are `MATERIALIZED` columns, and [module 8](08-data-model.md) walks
+through all of them. A real column, unlike a map value, can be part of the
+sorting key.
+
+> **Two unrelated meanings of "materialized".** A `MATERIALIZED` *column* is
+> a column computed from other columns of the same row when the row is
+> inserted. A *materialized view* (later in this module) is an insert trigger
+> that writes rows into a different table. Same word, different features.
+
 ClickHouse doesn't keep an index entry for every row; that index would be
 huge. Instead it splits each part into **granules** of 8192 rows and keeps
 one index entry, a **mark**, per granule: the key values of the granule's
@@ -177,14 +190,18 @@ mark 4 ─▶ ('sales-eng',   'sales-agent',   'agent_turn', 09:00:00)   ◀─ 
 ```
 
 For `WHERE org_owner = 'people-tech' AND org_service = 'hr-agent'`,
-ClickHouse looks at the marks, sees the matching rows can only be in
-granules 2 and 3, and reads just those. (The values above are only an
-illustration; real granules hold 8192 rows each.)
+ClickHouse looks at the marks and reads granules 1, 2 and 3. Granules 2 and
+3 start with `hr-agent` rows. Granule 1 starts with `support-agent` rows, but
+it runs up to where granule 2 begins, so its last rows *could* be `hr-agent`
+rows (with a span name that sorts before `agent_turn`); a mark only tells
+ClickHouse where a granule starts. Granules 0 and 4 can't match, so they're
+skipped. (The values above are only an illustration; real granules hold 8192
+rows each.)
 
 The index works best for filters on the **start** of the key (owner, then
 owner and service, and so on). A filter on a column that isn't in the key
 at all, like `TraceId = '...'`, can't use it, and ClickHouse would read
-every granule. Module 7 covers the extra indexes that fix that.
+every granule. Module 9 covers the extra indexes that fix that.
 
 **Choosing a key.** Pick it from your most common filters, and put
 **low-cardinality columns first** (cardinality is the number of distinct
@@ -208,18 +225,15 @@ Two rules follow:
   always stay separate.
 - So a whole day can be dropped by deleting its folders, which is instant.
 
-**TTL** (time to live) automates that:
-
-```sql
-TTL toDateTime(Timestamp) + INTERVAL 72 HOUR
-SETTINGS ttl_only_drop_parts = 1
-```
-
-The first line says "a row expires 72 hours after its timestamp". The
-setting says "don't rewrite parts to remove some of their rows; wait until
-**every** row in a part has expired, then drop the whole part". Because
-each part holds only one day, that happens soon after the day is 72 hours
-old.
+**TTL** (time to live) automates that. The table says "a row expires 72
+hours after its timestamp", plus a setting, `ttl_only_drop_parts`, that says
+"don't rewrite parts to remove some of their rows; wait until **every** row
+in a part has expired, then drop the whole part". Each part holds one day, so
+a part expires 72 hours after the *end* of its day. A span written just after
+midnight therefore lives about 96 hours, and one written just before midnight
+about 72. The part is actually removed when the next TTL merge runs, which
+can add a few hours. [Module 8](08-data-model.md) goes through the
+`PARTITION BY` and `TTL` clauses line by line.
 
 Partitions are mainly for **managing data**, not for speed. A time filter
 can skip whole partitions, but the sorting key does most of the speed work.
@@ -240,17 +254,22 @@ writes the result into a target table. Think of a restaurant order ticket
 with a carbon copy: when the order is written, the kitchen and the bill
 each get their own copy automatically.
 
-Here, every span insert into `otel_traces` also fills three tables:
+Here, every span insert into `otel_traces` also fills three smaller tables:
 
-| Table | Engine | Purpose |
-|---|---|---|
-| `otel_traces_trace_id_ts` | ReplicatedMergeTree | Trace id to time range, so a trace lookup can narrow the time range first |
-| `trace_entry` | ReplicatedReplacingMergeTree | One row per request (entry or root span): the "trace list" page |
-| `span_red_1m` | ReplicatedAggregatingMergeTree | Rate, errors and duration (RED) per service and span name per minute, kept 1 year |
+| Table | What it answers |
+|---|---|
+| `otel_traces_trace_id_ts` | "When did trace X happen?", so a trace lookup can narrow the time range first |
+| `trace_entry` | "List recent requests": the trace list page |
+| `span_red_1m` | Rate, errors and duration (RED) per service and span name per minute, kept 1 year |
 
-So the HR request's spans land in `otel_traces`, its `agent_turn` span adds
-a row to `trace_entry`, and every span updates the per-minute counts in
-`span_red_1m`. Module 10 explains each of these tables and engines.
+So the HR laptop request's spans land in `otel_traces`, and every span
+updates the per-minute counts in `span_red_1m`. Its `agent_turn` span (the
+root) and `ticket-api`'s server span both carry the request id, so both add
+a row to `trace_entry`. That table is a `ReplacingMergeTree`, which keeps one
+row per key when parts merge, preferring the root span. Read it with `FINAL`
+(merge at query time) and you get one row per request, led by its root span;
+without `FINAL` you may briefly see both rows until a background merge runs.
+[Module 8](08-data-model.md) walks through each table and its engine.
 
 ### Replication: why one server isn't enough
 
@@ -269,7 +288,7 @@ Each replica needs two pieces of identity, which come from **macros**
 ```xml
 <macros>
     <cluster>tracing</cluster>         <!-- the cluster this server belongs to -->
-    <shard>01</shard>                  <!-- which slice of the data (module 7); only one here -->
+    <shard>01</shard>                  <!-- which slice of the data (module 9); only one here -->
     <replica>clickhouse-01</replica>   <!-- this server's name among the replicas -->
 </macros>
 ```
@@ -343,32 +362,16 @@ tool that does the same job), which is why ClickHouse config calls it
 
 It does **not** store span data.
 
-**Raft and quorum.** In production you run several Keeper servers, so that
-Keeper itself isn't a single point of failure. They use the **Raft**
-consensus algorithm: they elect a leader, and a change counts only once a
-**majority** of Keeper servers (the **quorum**) has saved it. That way, two
-halves of a broken network can never both accept conflicting changes.
-Run 3 Keepers to survive 1 failure, or 5 to survive 2.
+**Quorum.** In production you run several Keeper servers, so Keeper itself
+isn't a single point of failure. They vote using the Raft algorithm: a change
+counts only once a **majority** (the **quorum**) has saved it, so two halves
+of a broken network can never both accept conflicting changes. Run 3 Keepers
+to survive 1 failure, or 5 to survive 2.
 
-This repo runs **one** Keeper, for simplicity. `clickhouse/keeper.xml` lists
-a single server in its `raft_configuration`:
-
-```xml
-<keeper_server>
-    <tcp_port>9181</tcp_port>          <!-- ClickHouse servers connect here -->
-    <server_id>1</server_id>           <!-- this Keeper's id -->
-    <raft_configuration>
-        <server>                       <!-- the only voting member -->
-            <id>1</id>
-            <hostname>clickhouse-keeper</hostname>
-            <port>9234</port>          <!-- Keeper-to-Keeper (Raft) traffic -->
-        </server>
-    </raft_configuration>
-</keeper_server>
-```
-
-With one member, the majority is 1, so it works alone. But if it stops,
-there's no Keeper at all, so replicated tables can't accept writes.
+This repo runs **one** Keeper, for simplicity: `clickhouse/keeper.xml` lists
+a single voting member, and ClickHouse servers connect to it on port 9181.
+With one member the majority is 1, so it works alone; but if it stops,
+replicated tables can't accept writes.
 
 ### Failure modes
 
@@ -426,8 +429,9 @@ Why each one behaves that way:
 - `otel-gateway-config.yaml`: the `batch` processor (1000 spans or 5 s) and
   the exporter's `retry_on_failure` (up to 300 s).
 
-Module 10 walks through every table's DDL (the `CREATE TABLE` statements),
-and shows how to add a replica or copy data to another ClickHouse server.
+[Module 8](08-data-model.md) walks through every table's DDL (the
+`CREATE TABLE` statements). Adding a replica and copying data to another
+ClickHouse server are in [module 10](10-copying-data.md).
 
 ## Lab (25 min)
 
@@ -470,7 +474,7 @@ own state.
    replication. The second lists what Keeper stores under the table's path:
 
    ```sql
-   SELECT zookeeper_path, replica_name, is_leader, queue_size, absolute_delay, active_replicas
+   SELECT zookeeper_path, replica_name, queue_size, absolute_delay, active_replicas
    FROM system.replicas WHERE table = 'otel_traces';
 
    SELECT name FROM system.zookeeper
@@ -483,20 +487,34 @@ own state.
    `active_replicas` should be 2. In the second, you'll see `log`, `blocks`,
    `replicas`, `mutations` and more: metadata only, no spans.
 
-4. **Stop Keeper.** This stops the Keeper container, waits for the servers
-   to notice, checks whether the tables are read-only, then tries an insert:
+4. **Stop Keeper.** First, while Keeper is still up, create a small
+   replicated table in a separate `lab` database, so the test insert doesn't
+   put a junk row into the real trace tables. `ON CLUSTER tracing` creates it
+   on both servers:
+
+   ```bash
+   docker exec clickhouse-01 clickhouse-client --password demo -q \
+     "CREATE DATABASE IF NOT EXISTS lab ON CLUSTER tracing"
+   docker exec clickhouse-01 clickhouse-client --password demo -q \
+     "CREATE TABLE IF NOT EXISTS lab.keeper_demo ON CLUSTER tracing (id UInt32, note String)
+      ENGINE = ReplicatedMergeTree ORDER BY id"
+   ```
+
+   Now stop the Keeper container, wait for the servers to notice, check
+   whether the tables are read-only, then try an insert into the lab table:
 
    ```bash
    docker stop clickhouse-keeper
    sleep 30
    docker exec clickhouse-01 clickhouse-client --password demo -q \
-     "SELECT table, is_readonly FROM system.replicas WHERE database = 'otel'"
+     "SELECT database, table, is_readonly FROM system.replicas WHERE database IN ('otel', 'lab')"
    docker exec clickhouse-01 clickhouse-client --password demo -q \
-     "INSERT INTO otel.trace_entry (TraceId) VALUES ('x')"
+     "INSERT INTO lab.keeper_demo VALUES (1, 'during the outage')"
    ```
 
-   All four tables show `is_readonly = 1`, and the insert fails (it can take a
-   while to give up):
+   Every replicated table shows `is_readonly = 1`, the four `otel` tables
+   and `lab.keeper_demo` alike, and the insert fails (it can take a while to
+   give up):
 
    ```text
    Code: 242. DB::Exception: Table is in readonly mode: replica_path=/clickhouse/tables/.../01/replicas/clickhouse-01. (TABLE_IS_READ_ONLY)
@@ -523,7 +541,9 @@ own state.
    ```
 
    The minutes during the outage have spans: they waited in the gateway's
-   queue and were written once Keeper was back. Nothing was lost.
+   queue and were written once Keeper was back. Nothing was lost. Run the lab
+   insert again and it succeeds. When you're done, remove the lab table:
+   `DROP TABLE lab.keeper_demo ON CLUSTER tracing SYNC`.
 
 5. **Stop one replica.** This stops `clickhouse-02`, checks the replica
    count from `clickhouse-01`, starts it again, then counts spans on each
@@ -570,7 +590,10 @@ own state.
   8192-row granule) skips granules for filters on the start of the key.
 - Partitions (one per day here) never merge with each other, so TTL can drop
   a whole day at once.
-- Materialized views run on each insert and fill summary tables.
+- With `ttl_only_drop_parts`, a day's spans live about 72 to 96 hours, and
+  go when a TTL merge drops the day's parts.
+- Materialized views run on each insert and fill summary tables. A
+  `MATERIALIZED` column is something else: a column computed on insert.
 - Replicas are full copies. Keeper holds the log of parts, not the data;
   replicas fetch parts from each other.
 - Keeper down: read-only, reads OK. One replica down: the other carries on.
@@ -596,7 +619,7 @@ into one part.
 
 No. `TraceId` isn't in the sorting key, so the marks say nothing about
 where a trace id might be, and ClickHouse would have to read every granule.
-Module 7 covers the bloom filter index and the lookup table that fix this.
+Module 9 covers the bloom filter index and the lookup table that fix this.
 </details>
 
 <details><summary>Why would partitioning by <code>ServiceName</code> be a bad idea?</summary>
@@ -625,6 +648,28 @@ Usually not. Replicated tables keep hashes of recent insert blocks in Keeper
 and ignore an identical block. This only works if the retried batch is
 byte-for-byte the same.
 </details>
+
+<details><summary>You count rows in <code>trace_entry</code> and get a few more than there are requests. Why, and how do you get one row per request?</summary>
+
+A request can add two rows: its root span and an API server span that
+carries the same request id. `ReplacingMergeTree` only collapses them, keeping
+the root, when a background merge runs. Query with `FINAL` to do that merge at
+read time: then it's one row per request, led by its root span.
+</details>
+
+<details><summary>A span was written at 00:05 on Monday. Roughly when is it deleted?</summary>
+
+Its part holds all of Monday, and with `ttl_only_drop_parts` the part is
+dropped only once every row has expired: 72 hours after Monday ends, so about
+Friday 00:00, roughly 96 hours later, at the next TTL merge.
+</details>
+
+## Next
+
+You now know how ClickHouse stores any table. [Module 8](08-data-model.md)
+answers "what exactly is in *our* tables?": it walks through `schema.sql`
+line by line, including the `MATERIALIZED` columns, the partition and TTL
+clauses, and the three tables the materialized views fill.
 
 ## Read more
 

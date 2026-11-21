@@ -1,4 +1,4 @@
-# Module 2: LangChain, LangGraph and callbacks (45 min)
+# Module 2: LangChain, LangGraph and callbacks (50 min)
 
 ## Why this matters
 
@@ -18,36 +18,30 @@ What you'll be able to do after this module:
 
 ## Key terms
 
+Spans, parent spans and the context (the "which span am I inside right now?"
+value) were covered in [module 1](01-otel-core.md). These are the new words.
+
 | Term | Plain meaning |
 |---|---|
-| LLM | Large language model: a program (such as GPT or Claude) that takes text in and returns text out. |
-| LLM call (chat call) | One request to an LLM: you send a list of messages, you get one reply message back, plus a count of tokens used. |
-| Token | The unit an LLM reads and writes, roughly a word or part of a word. Providers charge per token. |
+| LLM call (chat call) | One request to a large language model (LLM): you send a list of messages, you get one reply back, plus a count of **tokens** (word pieces, the unit providers charge for). |
 | Tool | An ordinary function the agent is allowed to run, such as "search the knowledge base" or "open a ticket". |
 | Agent | Code that uses an LLM to decide what to do next, then does it (often by calling tools). |
-| LangChain | A Python library that gives LLMs, tools and prompts one common interface. |
-| LangGraph | A library built on LangChain for wiring several steps (or several agents) into a graph. |
-| Graph | A set of steps (nodes) connected by arrows (edges) that say which step runs next. |
-| Node | One step in the graph: a Python function. Here each node is an agent. |
-| Edge | An arrow between nodes: "after this node, run that one". |
-| Conditional edge | An arrow whose target is chosen at run time, based on the current state. |
+| LangChain, LangGraph | LangChain gives LLMs, tools and prompts one common interface. LangGraph, built on it, wires several steps or agents into a graph. |
+| Graph, node, edge | A set of steps (nodes, each a Python function) joined by arrows (edges) that say which step runs next. A conditional edge picks its target at run time. |
 | State | A shared dictionary that every node reads from and writes to. |
-| Supervisor | A node whose only job is to decide which other node runs next. |
-| Sub-agent (worker) | A node that does real work and then hands control back to the supervisor. |
+| Supervisor, sub-agent (worker) | The supervisor node only decides who runs next; sub-agents do the work and hand control back. |
 | Checkpointer | Storage that saves the state after each step, so a conversation can continue on the next turn. |
 | Runnable | LangChain's common interface. Anything you can `.invoke(...)`: a model, a tool, a node, a whole graph. |
 | Callback | A function you hand to a library so it can call you back when something happens ("tell me when you start and finish"). |
 | Run, `run_id`, `parent_run_id` | One execution of a Runnable, its unique id, and the id of the run that called it. |
-| Span | The record of one timed operation, with a name, a start, an end and attributes ([module 1](01-otel-core.md)). |
-| Parent span | The span a span was started inside. Parents and children form the span tree. |
-| Context, current span | An invisible "which span am I inside right now?" value that OpenTelemetry keeps for the running code ([module 1](01-otel-core.md)). |
 
 ## Idea
 
 ### The running example
 
-We'll follow one request all the way through. A user asks the
-**support agent**: *"What does the collector do?"* The agent:
+We'll keep following the request from modules 0 and 1: a user asks the
+**support agent** *"What is a trace?"*. It's the first turn of a
+conversation, and it always succeeds. The agent:
 
 1. decides it needs to look something up,
 2. searches an internal knowledge base (an HTTP API, `kb-search-api`),
@@ -62,7 +56,7 @@ in mind; every concept below is a piece of it.
 
 **LLM call.** An LLM is a text-in, text-out program. You call it with a list
 of **messages**: usually a **system message** (standing instructions such as
-"Summarize the notes for the writer") and a **human message** (the user's
+"Summarise the notes for the writer.") and a **human message** (the user's
 words). It returns one reply message and reports how many tokens it read and
 wrote. That's one LLM call, also called a **chat call**. In this repo the
 model is a fake one (`FakeChatModel` in `agent/graph.py`) that waits a little,
@@ -86,10 +80,16 @@ write a reply.
 > realistic. In a real agent, the model's reply would drive the decision. The
 > tracing works the same either way.
 
-**Graph, node, edge.** When one agent isn't enough, you split the work into
-steps and draw arrows between them. That drawing is a **graph**. Each step is
-a **node** (a Python function), each arrow is an **edge**. A **conditional
-edge** is a fork in the road: the next node is picked at run time.
+**Graph, node, edge, state.** When one agent isn't enough, you split the work
+into steps and draw arrows between them. That drawing is a **graph**. Each
+step is a **node** (a Python function), each arrow is an **edge**. A
+**conditional edge** is a fork in the road: the next node is picked at run
+time. The nodes share a **state**, a dictionary that works like a whiteboard:
+each node reads it and returns only the fields it wants to change. For the
+support agent the state is `TurnState`, with `messages` (the conversation),
+`notes` (what the researcher found), `answer` (what the writer wrote), `next`
+(the supervisor's decision) and `fail_tool` (a switch the labs use to force a
+failure).
 
 **Supervisor and sub-agents.** A common shape is one boss and a few
 specialists. The **supervisor** node looks at the progress so far and picks
@@ -113,41 +113,9 @@ flowchart LR
 
 For our request, the path is: supervisor, researcher, supervisor, writer,
 supervisor, end. The supervisor runs three times; each worker runs once.
-
-### LangGraph: the graph as a state machine
-
-LangGraph runs a graph as a **state machine**: a system that moves from step
-to step, and at each step the current state decides what happens next.
-
-- **State** is a shared dictionary, like a whiteboard that every node can
-  read and write. Here it's `TurnState`, with `messages` (the conversation),
-  `notes` (what the researcher found), `answer` (what the writer wrote),
-  `next` (the supervisor's decision) and `fail_tool` (a switch the labs use to
-  force a failure).
-- A **node** is a function that takes the state and returns only the fields it
-  wants to change. The researcher returns `{"notes": ..., "messages": [...]}`.
-- A **reducer** says how a returned field is merged into the state. Most
-  fields are simply replaced. `messages` uses the `add_messages` reducer, so
-  new messages are appended to the list instead of overwriting it.
-- **Edges** are fixed (`researcher -> supervisor` always) or conditional. The
-  supervisor's conditional edge reads `state["next"]` and maps `researcher`,
-  `writer` or `FINISH` (which means `END`) to the next node.
-- LangGraph runs the graph in **steps** (LangGraph calls them supersteps).
-  Each node run is one step, numbered 1, 2, 3 and so on. The count belongs to
-  the conversation, not the turn: on a later turn it carries on from the
-  saved state (for example steps 25 to 29), not from 1.
-- A **checkpointer** saves the state after every step, filed under a
-  **`thread_id`** (one id per conversation). On the next turn of the same
-  conversation, LangGraph loads that saved state and continues. This repo uses
-  `InMemorySaver`, which keeps it in memory, and passes the conversation id as
-  the `thread_id`.
-
-One catch with the checkpointer: it would also carry last turn's `notes` and
-`answer` into the new turn, and the supervisor would think it was already
-done. So `agent/agents.py` lists per-turn fields in `turn_state` (for the
-support agent, `{"notes": "", "answer": ""}`), and `run.py` resets them at the
-start of every turn. `messages` is not reset, so the conversation history
-persists.
+LangGraph has a few more moving parts (how state is merged, how it's saved
+between turns); they're easier to follow once you've seen the spans, so
+they come [after the span tree](#under-the-hood-steps-and-the-checkpointer).
 
 ### LangChain: everything is a Runnable
 
@@ -175,7 +143,9 @@ def researcher(state: TurnState, config: RunnableConfig) -> dict[str, Any]:
 
 What to notice: `config` is passed to both `.invoke(...)` calls. One of the
 things `config` carries is the list of **callbacks**, so passing it on is what
-lets the tracer see the tool call and the chat call inside this node.
+lets the tracer see the tool call and the chat call inside this node. The
+return value is the state update: new `notes`, plus one message for the
+conversation.
 
 ### What a callback is
 
@@ -219,8 +189,9 @@ conventions, the subject of [module 3](03-genai-semconv.md).
 dictionary from `run_id` to span. For each event:
 
 1. **On start**, it looks up the span of the `parent_run_id`. If there is none
-   (the outermost run), it uses the turn span that `run.py` created. It starts
-   a new child span under that parent and stores it under the new `run_id`.
+   (the outermost run), it uses the turn span that `run.py` created (next
+   section). It starts a new child span under that parent and stores it under
+   the new `run_id`.
 2. **For plumbing runs**, it creates no span. LangGraph also reports small
    internal runs, such as the routing function that reads `state["next"]`.
    A span for those would be noise. But their children still need a parent, so
@@ -263,6 +234,79 @@ on_chain_start      support_supervisor   invoke_workflow support_supervisor
   ...
 ```
 
+### Lab 1 (5 min): see the raw callbacks
+
+This script attaches a handler that only prints events (it exports no spans)
+and starts the knowledge-base API for the researcher's tool. It asks its own
+question, *"What is a span?"*, but the path through the graph is the same as
+for *"What is a trace?"*. Pause the background traffic first so port 18081 is
+free:
+
+```bash
+./stack.sh traffic off
+cd agent && .venv/bin/python ../docs/tutorial/labs/print_callbacks.py
+```
+
+```text
+on_chain_start         #1 parent=   -  node=            support_supervisor
+on_chain_start         #2 parent=  #1  node=supervisor  supervisor
+on_chat_model_start    #3 parent=  #2  node=supervisor  fake-supervisor
+on_chain_start         #4 parent=  #2  node=supervisor  RunnableCallable
+on_chain_start         #5 parent=  #1  node=researcher  researcher
+on_tool_start          #6 parent=  #5  node=researcher  search_knowledge_base
+on_chat_model_start    #7 parent=  #5  node=researcher  fake-researcher
+on_chain_start         #8 parent=  #1  node=supervisor  supervisor
+on_chat_model_start    #9 parent=  #8  node=supervisor  fake-supervisor
+on_chain_start        #10 parent=  #8  node=supervisor  RunnableCallable
+on_chain_start        #11 parent=  #1  node=writer      writer
+on_chat_model_start   #12 parent= #11  node=writer      fake-writer
+on_tool_start         #13 parent= #11  node=writer      count_words
+on_chain_start        #14 parent=  #1  node=supervisor  supervisor
+on_chat_model_start   #15 parent= #14  node=supervisor  fake-supervisor
+on_chain_start        #16 parent= #14  node=supervisor  RunnableCallable
+```
+
+How to read it: `#N` is a short number for each `run_id`, and `parent=` is
+the short number of its `parent_run_id`.
+
+- `#1` has no parent, so it becomes `invoke_workflow support_supervisor`.
+- `#2`, `#5`, `#8`, `#11`, `#14` have a name equal to their node, so each
+  becomes an `invoke_agent` span.
+- `#4`, `#10`, `#16` are the routing function (`RunnableCallable`):
+  plumbing, no span.
+- The supervisor appears three times, once per decision.
+- There's no line for the HTTP request: that's not a LangChain Runnable.
+  It's the `call_api` span, which the tracer places under the tool span
+  (see [below](#the-tricky-part-tools-that-make-http-calls)).
+
+Leave the traffic off for now; Lab 2 turns it back on.
+
+### Where does the trace start?
+
+Not in LangGraph. `agent/run.py` opens one `agent_turn` span for each user
+turn; that's the root of the trace. Before that, it puts the tenant and a
+request id into **baggage**, the key-value pairs that travel with the request
+to downstream services ([module 1](01-otel-core.md#baggage-request-wide-values-you-carry-along)).
+Then it calls the graph with the tracer as a callback:
+
+```python
+handler = LangGraphTracer(tracer, turn, conversation_id=conversation_id, ...)
+result = graph.invoke(
+    {**spec.turn_state, "messages": [HumanMessage(question)], "fail_tool": ...},
+    config={"callbacks": [handler], "configurable": {"thread_id": conversation_id}},
+)
+```
+
+What to notice:
+
+- `turn` is the `agent_turn` span. The tracer uses it as the parent of the
+  outermost run, so `invoke_workflow` hangs under `agent_turn`.
+- `"callbacks": [handler]` is how the tracer gets every event.
+- `"thread_id": conversation_id` tells LangGraph which saved conversation
+  this turn belongs to, and `{**spec.turn_state, ...}` clears a few fields
+  before the turn starts. Both are explained in
+  [Under the hood](#under-the-hood-steps-and-the-checkpointer).
+
 ### The tricky part: tools that make HTTP calls
 
 **The problem.** The researcher's tool calls the knowledge-base API over HTTP.
@@ -277,7 +321,7 @@ fake model starts spans of its own. But the HTTP helper `call_api` in
 `agent/telemetry.py` starts its client span with `start_as_current_span(...)`,
 which picks its parent from the current context. If the tool span isn't
 current, the HTTP span's parent would be whatever span *is* current: the
-`agent_turn` span.
+`agent_turn` span from the previous section.
 
 **The fix.** In `on_tool_start`, the tracer makes the tool span current with
 `context.attach(...)`, and undoes it with `context.detach(...)` in
@@ -285,16 +329,10 @@ current, the HTTP span's parent would be whatever span *is* current: the
 there: LangChain runs the tool body in a copy of the current context, so the
 tool span must already be current when the tool starts.
 
-Then three things happen in a chain:
-
-1. `call_api` starts `GET /v1/search` as a child of the tool span.
-2. `propagate.inject(headers)` writes the trace id and that span's id into the
-   `traceparent` HTTP header (and the tenant and request id into the
-   `baggage` header). A **header** is a name and value sent along with an HTTP
-   request; **propagation** is the act of carrying trace context across a
-   process boundary this way ([module 1](01-otel-core.md)).
-3. `kb-search-api` reads those headers and starts its own server span as a
-   child of the client span. The API's work joins the same trace.
+From there, it's ordinary propagation, exactly as in
+[module 1](01-otel-core.md#propagation-carrying-context-across-the-network):
+`call_api` starts `GET /v1/search` as a child of the tool span and writes the
+`traceparent` header, and `kb-search-api` continues the trace from it.
 
 ```text
 execute_tool search_knowledge_base          (made current by context.attach)
@@ -302,29 +340,10 @@ execute_tool search_knowledge_base          (made current by context.attach)
     └── GET /v1/search    kb-search-api     server span, reads traceparent
 ```
 
-### Where does the trace start?
+### The full span tree
 
-Not in LangGraph. `agent/run.py` opens one `agent_turn` span for each user
-turn; that's the root of the trace. Before that, it puts the tenant and a
-request id into **baggage** (key-value pairs that travel with the request to
-downstream services). Then it calls the graph with the tracer as a callback:
-
-```python
-handler = LangGraphTracer(tracer, turn, conversation_id=conversation_id, ...)
-result = graph.invoke(
-    {**spec.turn_state, "messages": [HumanMessage(question)], "fail_tool": ...},
-    config={"callbacks": [handler], "configurable": {"thread_id": conversation_id}},
-)
-```
-
-What to notice:
-
-- `"callbacks": [handler]` is how the tracer gets every event.
-- `"thread_id": conversation_id` tells the checkpointer which saved
-  conversation this turn belongs to.
-- `{**spec.turn_state, ...}` resets the per-turn fields described above.
-
-The full span tree for our request (16 spans, two services):
+Here is every span of our request: 16 spans, from two services. The step
+numbers are LangGraph's (`langgraph_step`), copied onto each agent span.
 
 ```text
 agent_turn                                     run.py
@@ -345,6 +364,45 @@ agent_turn                                     run.py
         └── chat fake-supervisor
 ```
 
+### Under the hood: steps and the checkpointer
+
+Now that you've seen the spans, here are the LangGraph details behind them.
+
+- **Reducers.** A node returns only the fields it changes, and a **reducer**
+  says how each returned field is merged into the state. Most fields are
+  simply replaced. `messages` uses the `add_messages` reducer, so new
+  messages are appended to the list instead of overwriting it. That's why
+  the researcher can return a one-item `messages` list without losing the
+  question.
+- **Edges in code.** `researcher -> supervisor` and `writer -> supervisor`
+  are fixed edges. The supervisor's conditional edge reads `state["next"]`
+  and maps `researcher`, `writer` or `FINISH` (which means `END`) to the next
+  node. That reading function is the `RunnableCallable` plumbing run from
+  Lab 1.
+- **Steps (supersteps).** LangGraph runs a graph in rounds it calls
+  supersteps. In each round, every node that is ready runs, and nodes that
+  are ready at the same time run in parallel. The support graph is a simple
+  chain, so only one node is ever ready, and each step is exactly one node
+  run: steps 1 to 5 in the tree above. In a graph with parallel branches,
+  several `invoke_agent` spans could share one step number.
+- **Checkpointer and `thread_id`.** A **checkpointer** saves the state after
+  every step, filed under a **`thread_id`** (one id per conversation). On the
+  next turn of the same conversation, LangGraph loads that saved state and
+  continues. This repo uses `InMemorySaver`, which keeps it in memory, and
+  passes the conversation id as the `thread_id`.
+- **Step numbers continue across turns.** The step count belongs to the
+  conversation, not the turn. Turn 1 always has steps 1 to 5; later turns of
+  the same conversation carry on from there (in one stored conversation,
+  turn 3 ran steps 11 to 15). So don't expect `org.agent.step` to restart
+  at 1 on every turn.
+- **Resetting per-turn fields.** The checkpointer would also carry last
+  turn's `notes` and `answer` into the new turn, and the supervisor would
+  think it was already done. So `agent/agents.py` lists per-turn fields in
+  `turn_state` (for the support agent, `{"notes": "", "answer": ""}`), and
+  `run.py` resets them at the start of every turn with
+  `{**spec.turn_state, ...}`. `messages` is not reset, so the conversation
+  history persists.
+
 ## Remember it
 
 > **LangChain shouts "I started, I finished" with a run id and a parent id.
@@ -361,10 +419,10 @@ head waiter, checkpointer = saving the whiteboard between turns.**
   latency and token usage (`usage_metadata`), so the graph runs without an LLM
   key. `AGENTS` maps node names to roles (`supervisor` or `worker`).
 - `agent/agents.py`: all three agent services (`support-agent`, `hr-agent`,
-  `sales-agent`), each with an owner, an interface, tenants, node roles and the
-  `turn_state` fields to reset each turn. The HR agent is a single node with no
-  supervisor; the sales agent has its own supervisor (`sales_planner`) and one
-  worker (`quoter`).
+  `sales-agent`), each with an owner, an interface, tenants, sample
+  questions, node roles and the `turn_state` fields to reset each turn. The
+  HR agent is a single node with no supervisor; the sales agent has its own
+  supervisor (`sales_planner`) and one worker (`quoter`).
 - `agent/tools.py`: the tools. Most call the small HTTP APIs in `agent/apis.py`
   through `call_api`.
 - `agent/telemetry.py`, `LangGraphTracer`: the callbacks-to-spans mapping, the
@@ -373,52 +431,16 @@ head waiter, checkpointer = saving the whiteboard between turns.**
 - `agent/run.py`: the `agent_turn` span, baggage, and `graph.invoke(...)` with
   the tracer as a callback.
 
-## Lab (15 min)
+## Lab 2 (10 min)
 
-1. See the raw callbacks for one turn. This script attaches a handler that
-   only prints events (it exports no spans) and starts the knowledge-base API
-   for the researcher's tool. Pause the background traffic first so port
-   18081 is free:
+Lab 1 is [above](#lab-1-5-min-see-the-raw-callbacks), after "How callbacks
+become spans". Run SQL with
+`docker exec clickhouse-01 clickhouse-client --password demo -q "..."` or in
+<http://localhost:8123/play> (user `default`, password `demo`).
 
-   ```bash
-   ./stack.sh traffic off
-   cd agent && .venv/bin/python ../docs/tutorial/labs/print_callbacks.py
-   ```
-
-   ```text
-   on_chain_start         #1 parent=   -  node=            support_supervisor
-   on_chain_start         #2 parent=  #1  node=supervisor  supervisor
-   on_chat_model_start    #3 parent=  #2  node=supervisor  fake-supervisor
-   on_chain_start         #4 parent=  #2  node=supervisor  RunnableCallable
-   on_chain_start         #5 parent=  #1  node=researcher  researcher
-   on_tool_start          #6 parent=  #5  node=researcher  search_knowledge_base
-   on_chat_model_start    #7 parent=  #5  node=researcher  fake-researcher
-   on_chain_start         #8 parent=  #1  node=supervisor  supervisor
-   on_chat_model_start    #9 parent=  #8  node=supervisor  fake-supervisor
-   on_chain_start        #10 parent=  #8  node=supervisor  RunnableCallable
-   on_chain_start        #11 parent=  #1  node=writer      writer
-   on_chat_model_start   #12 parent= #11  node=writer      fake-writer
-   on_tool_start         #13 parent= #11  node=writer      count_words
-   on_chain_start        #14 parent=  #1  node=supervisor  supervisor
-   on_chat_model_start   #15 parent= #14  node=supervisor  fake-supervisor
-   on_chain_start        #16 parent= #14  node=supervisor  RunnableCallable
-   ```
-
-   How to read it: `#N` is a short number for each `run_id`, and `parent=`
-   is the short number of its `parent_run_id`. Match each line to the span
-   tree above:
-
-   - `#1` has no parent, so it becomes `invoke_workflow support_supervisor`.
-   - `#2`, `#5`, `#8`, `#11`, `#14` have a name equal to their node, so each
-     becomes an `invoke_agent` span.
-   - `#4`, `#10`, `#16` are the routing function (`RunnableCallable`):
-     plumbing, no span.
-   - The supervisor appears three times, once per decision.
-   - There's no line for the HTTP request: that's not a LangChain Runnable.
-     It's the `call_api` span, which the tracer places under the tool span.
-
-2. Run a short round yourself and find the agent spans. `simulate.py` starts
-   the APIs and runs all three agent services for two turns each:
+1. Run a short round yourself and find the agent spans. From the `agent`
+   folder (where Lab 1 left you), `simulate.py` starts the APIs and runs all
+   three agent services for two turns each:
 
    ```bash
    .venv/bin/python simulate.py --turns 2
@@ -435,8 +457,8 @@ head waiter, checkpointer = saving the whiteboard between turns.**
    What to notice: each service has its own node names. `support-agent` has
    more `invoke_agent supervisor` spans than researcher or writer spans,
    because the supervisor runs three times per turn. `hr-agent` has only
-   `invoke_agent hr_assistant`. The counts include the background traffic
-   from before you paused it.
+   `invoke_agent hr_assistant`. The counts may include background traffic
+   from just before you paused it.
 
    Then turn the background traffic back on:
 
@@ -444,9 +466,10 @@ head waiter, checkpointer = saving the whiteboard between turns.**
    cd .. && ./stack.sh traffic on
    ```
 
-3. See a failed tool. The background loop makes turn 2 of every
-   support-agent conversation fail its knowledge-base search (it runs with
-   `--fail-turn 2`). List recent error spans:
+2. See a failed tool. This is the one place we leave the running example: the
+   background loop makes turn 2 of every support-agent conversation
+   (*"What does the collector do?"*) fail its knowledge-base search, because
+   it runs with `--fail-turn 2`. List recent error spans:
 
    ```sql
    SELECT ServiceName, SpanName, StatusMessage, SpanAttributes['error.type'] AS error
@@ -487,7 +510,8 @@ head waiter, checkpointer = saving the whiteboard between turns.**
    - The earlier supervisor step finished before the failure, so it stays
      `Unset` (OpenTelemetry's default "no status set", which means it didn't
      fail).
-   - The turn stopped at the failure: there are no writer spans.
+   - The turn stopped at the failure: there are no writer spans. Compare with
+     the 16-span tree of the successful turn 1 above.
 
 ## Explain it back
 
@@ -497,10 +521,11 @@ head waiter, checkpointer = saving the whiteboard between turns.**
 > keeps state per conversation thread. Every node, model and tool call is a
 > LangChain Runnable, and Runnables report start and end events to callbacks
 > with a run id and a parent run id. Our callback handler maps those events to
-> OpenTelemetry spans: the root becomes `invoke_workflow`, agent nodes become
-> `invoke_agent`, model calls become `chat`, tools become `execute_tool`, and
-> plumbing gets no span. The tool span is made current so the HTTP calls it
-> makes, and the APIs behind them, join the same trace under it."
+> OpenTelemetry spans under the `agent_turn` root: the graph becomes
+> `invoke_workflow`, agent nodes become `invoke_agent`, model calls become
+> `chat`, tools become `execute_tool`, and plumbing gets no span. The tool
+> span is made current so the HTTP calls it makes, and the APIs behind them,
+> join the same trace under it."
 
 ## Recap
 
@@ -508,16 +533,16 @@ head waiter, checkpointer = saving the whiteboard between turns.**
   plain function; an agent combines them to reach an answer.
 - LangGraph runs a graph of nodes over shared state. A supervisor routes;
   workers do the work and hand back control. A checkpointer saves state per
-  `thread_id`.
+  `thread_id`, and step numbers continue across the turns of a conversation.
 - Everything in LangChain is a Runnable, and `config` (which carries the
   callbacks) is passed down to every nested call.
 - Callbacks report start, end and error with a `run_id` and `parent_run_id`:
   a ready-made call tree.
 - `LangGraphTracer` turns that tree into spans and skips plumbing runs, while
   keeping their children attached.
+- The trace root is `agent_turn`, created in `run.py`, one per user turn.
 - The tool span is made current so HTTP calls, and the APIs behind them, nest
   under the tool that made them.
-- The trace root is `agent_turn`, created in `run.py`, one per user turn.
 
 ## Check yourself
 
@@ -570,6 +595,15 @@ children of `agent_turn` (the context's current span) instead of
 you couldn't tell which tool made which call.
 </details>
 
+<details><summary>Turn 1 has agent spans at steps 1 to 5. Would a graph with two workers running side by side still have one step per agent span?</summary>
+
+No. A LangGraph step (superstep) runs every node that is ready at that
+moment, in parallel. Two workers started together would run in the same
+step, so their two `invoke_agent` spans would share one step number. The
+support graph only ever has one ready node, which is why its step numbers
+and agent spans line up one to one.
+</details>
+
 <details><summary>Why does <code>run.py</code> reset <code>notes</code> and <code>answer</code> at the start of each turn?</summary>
 
 The checkpointer restores the whole saved state for the conversation's
@@ -577,6 +611,13 @@ The checkpointer restores the whole saved state for the conversation's
 the supervisor would see an answer already present and finish immediately
 without doing any work.
 </details>
+
+## Next
+
+You've seen the span names `invoke_agent`, `chat` and `execute_tool`, and
+labels such as token counts and agent names. [Module 3](03-genai-semconv.md)
+answers where those names come from: the GenAI semantic conventions, the
+shared rulebook that says which attributes belong on which span.
 
 ## Read more
 

@@ -1,4 +1,4 @@
-# Module 9: Explain-it-back cheat sheet and glossary (20 min, plus the glossary as a reference)
+# Module 13: Explain-it-back cheat sheet and glossary (20 min, plus the glossary as a reference)
 
 ## Why this matters
 
@@ -109,7 +109,7 @@ agent_turn                                  root, from run.py
 
 Token counts go on the `chat` span only, so totals are never counted twice.
 
-**3. Tools call APIs, and the trace crosses processes** ([module 1](01-otel-core.md), [module 8](08-cross-environment.md)).
+**3. Tools call APIs, and the trace crosses processes** ([module 1](01-otel-core.md), [module 6](06-cross-environment.md)).
 `lookup_employee` calls `legacy-hr-api`, and `create_ticket` calls
 `ticket-api`. Before each call, the agent **injects** the `traceparent`
 header (trace id, plus its own span id as the new parent) and the `baggage`
@@ -143,7 +143,7 @@ The `clickhouse` **exporter** then writes the batch. It has a **sending
 queue** and retries for up to 300 seconds, so a short ClickHouse outage loses
 nothing.
 
-**6. ClickHouse shelves them** ([module 6](06-clickhouse.md), [module 10](10-data-model.md)).
+**6. ClickHouse shelves them** ([module 7](07-clickhouse.md), [module 8](08-data-model.md)).
 Each span becomes **one row** in `otel.otel_traces`. ClickHouse is a **column
 store**: each column is stored and compressed on its own. The insert creates
 a new **part**, sorted by `(org_owner, org_service, SpanName, time)`, inside
@@ -154,21 +154,21 @@ views** fire on the insert and fill a trace-id lookup table, a
 one-row-per-trace table (`trace_entry`), and a per-minute summary
 (`span_red_1m`). **TTL** deletes raw spans after 72 hours.
 
-**7. The second replica copies it** ([module 6](06-clickhouse.md)).
+**7. The second replica copies it** ([module 7](07-clickhouse.md)).
 The gateway wrote to `clickhouse-01`. That server tells **Keeper** "a new
 part exists". `clickhouse-02` sees the note and downloads the part straight
 from `clickhouse-01`. Keeper is the notary that records which parts exist; it
 never holds the data. If Keeper is down, tables go **read-only**: reads still
 work, and the gateway queues and retries.
 
-**8. Someone looks at the trace** ([module 7](07-sharding-indexes.md)).
+**8. Someone looks at the trace** ([module 9](09-sharding-indexes.md)).
 A query asks for `WHERE TraceId = '...'`. The trace id isn't in the sorting
 key, so a **bloom filter skip index** on `TraceId` lets ClickHouse skip
 blocks that can't contain it, and the lookup table says when the trace
 happened, so whole days can be skipped. The result is the span tree from
 step 2, with the API spans from step 3 under the right parents.
 
-**9. At larger scale** ([module 5](05-sampling.md), [module 7](07-sharding-indexes.md), [module 11](11-s3-tiering.md)).
+**9. At larger scale** ([module 5](05-sampling.md), [module 9](09-sharding-indexes.md), [module 11](11-s3-tiering.md)).
 You'd **sample** (keep only some traces): decide at the start in the SDK
 (head sampling), or after the trace ends in a Collector (tail sampling). You'd
 **shard** (split data across servers) by a hash of the trace id, so each
@@ -205,22 +205,22 @@ letter, ignoring backticks and symbols.
 
 | Term | Meaning | Module |
 |---|---|---|
-| `absolute_delay` | Column in `system.replicas`: how many seconds a replica is behind its peer | [6](06-clickhouse.md), [12](12-operations.md) |
-| `active_replicas` | Column in `system.replicas`: how many copies of the table are online now, out of `total_replicas` | [6](06-clickhouse.md) |
+| `absolute_delay` | Column in `system.replicas`: how many seconds a replica is behind its peer | [6](07-clickhouse.md), [12](12-operations.md) |
+| `active_replicas` | Column in `system.replicas`: how many copies of the table are online now, out of `total_replicas` | [6](07-clickhouse.md) |
 | Agent (AI) | A program that uses an LLM to decide what to do next, and calls tools. Here: `support-agent`, `hr-agent`, `sales-agent` | [0](00-setup.md) |
 | Agent (Collector pattern) | A Collector running next to the app (a sidecar, or one per machine), so the app hands off spans quickly. Unrelated to AI agents | [4](04-collector.md) |
 | `agent_turn` | This repo's root span: one per user turn, opened by `agent/run.py` | [2](02-langgraph.md) |
-| AggregatingMergeTree | ClickHouse table engine that stores partial aggregation states (half-finished sums and percentiles) and combines them during merges. Used by `span_red_1m` | [10](10-data-model.md) |
+| AggregatingMergeTree | ClickHouse table engine that stores partial aggregation states (half-finished sums and percentiles) and combines them during merges. Used by `span_red_1m` | [10](08-data-model.md) |
 | Alert | An automatic message to a person when a metric crosses a threshold for long enough | [12](12-operations.md) |
-| ALIAS column | A ClickHouse column computed when you query it, never stored | [10](10-data-model.md) |
-| `any(x)` | ClickHouse aggregate: "some value of `x` from the group, I don't care which". Not the same as OTLP's `AnyValue` | [7](07-sharding-indexes.md) |
-| `AnyValue` | The OTLP data type that lets an attribute value be a string, number, boolean, list or map | [7](07-sharding-indexes.md) |
+| ALIAS column | A ClickHouse column computed when you query it, never stored | [10](08-data-model.md) |
+| `any(x)` | ClickHouse aggregate: "some value of `x` from the group, I don't care which". Not the same as OTLP's `AnyValue` | [7](09-sharding-indexes.md) |
+| `AnyValue` | The OTLP data type that lets an attribute value be a string, number, boolean, list or map | [7](09-sharding-indexes.md) |
 | API (OpenTelemetry) | The `opentelemetry-api` package that libraries call to create spans. Without an SDK installed, it does nothing, so it costs nothing | [1](01-otel-core.md) |
 | API (HTTP) | A service that answers HTTP requests. Here: `kb-search-api`, `ticket-api`, `pricing-api`, `legacy-hr-api` | [0](00-setup.md) |
-| `ARRAY JOIN` | ClickHouse clause that turns each element of an array (such as a span's events) into its own row | [10](10-data-model.md) |
-| `async_insert` | ClickHouse setting where the server collects many small inserts and writes them together, instead of the client batching | [6](06-clickhouse.md) |
+| `ARRAY JOIN` | ClickHouse clause that turns each element of an array (such as a span's events) into its own row | [10](08-data-model.md) |
+| `async_insert` | ClickHouse setting where the server collects many small inserts and writes them together, instead of the client batching | [6](07-clickhouse.md) |
 | Attribute | A key-value fact on a span, such as `http.response.status_code = 504`. Like a label on a parcel | [1](01-otel-core.md) |
-| Auto-instrumentation | Libraries that add spans and header propagation to common frameworks without code changes, such as `opentelemetry-instrument python app.py` | [8](08-cross-environment.md) |
+| Auto-instrumentation | Libraries that add spans and header propagation to common frameworks without code changes, such as `opentelemetry-instrument python app.py` | [8](06-cross-environment.md) |
 
 ### B
 
@@ -229,13 +229,13 @@ letter, ignoring backticks and symbols.
 | Back-pressure | A busy component telling the sender "not now, try later" instead of crashing. Like a "full, come back later" sign on a shop door | [4](04-collector.md), [12](12-operations.md) |
 | Backend | Where telemetry is finally stored and queried. Here, ClickHouse | [4](04-collector.md) |
 | Backoff (exponential) | Waiting longer between each retry (5 s, then about 7 s, and so on, up to 30 s here), so a struggling server isn't hammered | [4](04-collector.md) |
-| BACKUP / RESTORE | ClickHouse statements that save a table to a disk or S3 and load it back | [10](10-data-model.md), [12](12-operations.md) |
+| BACKUP / RESTORE | ClickHouse statements that save a table to a disk or S3 and load it back | [10](08-data-model.md), [12](12-operations.md) |
 | Baggage | Key-value data that travels with a request in the `baggage` header, such as `org.tenant`. It isn't put on spans unless a service chooses to copy it. Like luggage you carry but don't unpack | [1](01-otel-core.md) |
 | Batch | A group of spans sent together in one request | [1](01-otel-core.md), [4](04-collector.md) |
 | `batch` processor | Collector processor that groups spans (here up to 1000, or every 5 s) so ClickHouse gets few, large inserts | [4](04-collector.md) |
 | `BatchSpanProcessor` | SDK component that queues finished spans in memory (2048 at most) and exports them in batches (512, every 5 s) from a background thread. Full queue: new spans are dropped | [1](01-otel-core.md) |
-| Block (insert block) | A chunk of rows ClickHouse handles as one unit during an insert. Materialized views run once per block; Keeper keeps block hashes to spot duplicates | [6](06-clickhouse.md) |
-| Bloom filter | A compact structure that answers "definitely not here" or "maybe here". As a skip index, it lets ClickHouse skip blocks that can't contain an id | [7](07-sharding-indexes.md) |
+| Block (insert block) | A chunk of rows ClickHouse handles as one unit during an insert. Materialized views run once per block; Keeper keeps block hashes to spot duplicates | [6](07-clickhouse.md) |
+| Bloom filter | A compact structure that answers "definitely not here" or "maybe here". As a skip index, it lets ClickHouse skip blocks that can't contain an id | [7](09-sharding-indexes.md) |
 
 ### C
 
@@ -246,16 +246,16 @@ letter, ignoring backticks and symbols.
 | Cardinality | How many distinct values something has. A span name with an id in it has unbounded cardinality, which breaks grouping and bloats indexes | [1](01-otel-core.md) |
 | `chat` span | GenAI span for one LLM call: provider, model, finish reasons and token usage | [3](03-genai-semconv.md) |
 | Checkpointer | LangGraph component that saves the graph's state after every step, so the next turn of the same conversation continues. Here `InMemorySaver` | [2](02-langgraph.md) |
-| `cityHash64` | A fast hash function. `cityHash64(TraceId)` turns a trace id into a number that picks the shard | [7](07-sharding-indexes.md) |
-| ClickHouse | The column-store database that stores the spans here, as two replicas | [6](06-clickhouse.md) |
-| `clickhouse-init` | One-off container that applies `clickhouse/schema.sql` and waits until all tables are writable before the gateway starts | [6](06-clickhouse.md) |
+| `cityHash64` | A fast hash function. `cityHash64(TraceId)` turns a trace id into a number that picks the shard | [7](09-sharding-indexes.md) |
+| ClickHouse | The column-store database that stores the spans here, as two replicas | [6](07-clickhouse.md) |
+| `clickhouse-init` | One-off container that applies `clickhouse/schema.sql` and waits until all tables are writable before the gateway starts | [6](07-clickhouse.md) |
 | Client span | A span of kind `CLIENT`: "I called someone". Paired with the callee's server span, it shows an edge between two services | [1](01-otel-core.md) |
-| Clock skew | Different machines' clocks disagreeing, so a child span can seem to start before its parent. Trust the parent links over the timestamps | [8](08-cross-environment.md) |
-| Cluster | A named group of ClickHouse servers. `tracing` here: 1 shard, 2 replicas | [6](06-clickhouse.md) |
-| `clusterAllReplicas()` | ClickHouse function that runs a query on every replica of a cluster | [6](06-clickhouse.md) |
-| Codec | How a ClickHouse column is compressed, such as `CODEC(Delta, ZSTD(1))` | [10](10-data-model.md) |
+| Clock skew | Different machines' clocks disagreeing, so a child span can seem to start before its parent. Trust the parent links over the timestamps | [8](06-cross-environment.md) |
+| Cluster | A named group of ClickHouse servers. `tracing` here: 1 shard, 2 replicas | [6](07-clickhouse.md) |
+| `clusterAllReplicas()` | ClickHouse function that runs a query on every replica of a cluster | [6](07-clickhouse.md) |
+| Codec | How a ClickHouse column is compressed, such as `CODEC(Delta, ZSTD(1))` | [10](08-data-model.md) |
 | Collector | The OpenTelemetry Collector: a separate program that receives telemetry, processes it, and sends it on. Like a company mailroom | [4](04-collector.md) |
-| Column store | A database that stores each column separately, so a query reading 3 of 40 columns reads only those 3 | [6](06-clickhouse.md) |
+| Column store | A database that stores each column separately, so a query reading 3 of 40 columns reads only those 3 | [6](07-clickhouse.md) |
 | Conditional edge | A LangGraph edge that picks the next node at run time, for example from the supervisor's `next` field | [2](02-langgraph.md) |
 | Connector | A Collector component that is the exporter of one pipeline and the receiver of another, such as `spanmetrics` (spans to metrics) | [4](04-collector.md) |
 | Consumers (queue) | Workers that take batches from the exporter's sending queue and send them; 10 by default | [4](04-collector.md) |
@@ -263,24 +263,24 @@ letter, ignoring backticks and symbols.
 | `context.attach` | Makes a span current. The tracer does this on tool start, so HTTP calls made by the tool become its children | [2](02-langgraph.md) |
 | Conversation id | `gen_ai.conversation.id`: the attribute that links the turns of one session | [3](03-genai-semconv.md) |
 | Counter | A metric that only goes up, like a car's odometer. You watch how fast it rises | [12](12-operations.md) |
-| `create_schema: false` | Exporter setting: don't create tables automatically; this repo's `schema.sql` defines them | [4](04-collector.md), [10](10-data-model.md) |
+| `create_schema: false` | Exporter setting: don't create tables automatically; this repo's `schema.sql` defines them | [4](04-collector.md), [10](08-data-model.md) |
 
 ### D
 
 | Term | Meaning | Module |
 |---|---|---|
 | DaemonSet | Kubernetes term for "run one copy on every machine"; a common way to deploy agent Collectors | [4](04-collector.md) |
-| DDL | Data definition language: SQL that changes structure (`CREATE`, `ALTER`, `DROP`) rather than data | [10](10-data-model.md) |
-| DDL queue | Keeper's list of `ON CLUSTER` commands that every node must run | [6](06-clickhouse.md), [10](10-data-model.md) |
+| DDL | Data definition language: SQL that changes structure (`CREATE`, `ALTER`, `DROP`) rather than data | [10](08-data-model.md) |
+| DDL queue | Keeper's list of `ON CLUSTER` commands that every node must run | [6](07-clickhouse.md), [10](08-data-model.md) |
 | `debug` exporter | Collector exporter that prints a short summary of each batch to the gateway's log | [4](04-collector.md) |
 | `decision_wait` | Tail sampling setting: how long to wait for late spans of a trace before deciding (10 s in the lab) | [5](05-sampling.md) |
-| Deduplication (insert) | Replicated tables keep hashes of recent insert blocks in Keeper, so a retried identical batch isn't stored twice | [6](06-clickhouse.md) |
-| DEFAULT column | A ClickHouse column filled from an expression on insert, unless the insert gives a value | [10](10-data-model.md) |
+| Deduplication (insert) | Replicated tables keep hashes of recent insert blocks in Keeper, so a retried identical batch isn't stored twice | [6](07-clickhouse.md) |
+| DEFAULT column | A ClickHouse column filled from an expression on insert, unless the insert gives a value | [10](08-data-model.md) |
 | Delayed inserts | ClickHouse slowing inserts down because a partition has too many parts (1000 by default) | [12](12-operations.md) |
 | Disk (ClickHouse) | A place bytes can live: the local disk, an S3 bucket, or a cache | [11](11-s3-tiering.md) |
-| Distributed table | A ClickHouse table that stores nothing; it routes inserts to shards and fans queries out to all of them | [7](07-sharding-indexes.md) |
+| Distributed table | A ClickHouse table that stores nothing; it routes inserts to shards and fans queries out to all of them | [7](09-sharding-indexes.md) |
 | Distribution (Collector) | A build of the Collector with a chosen set of components. This repo uses `otelcol-contrib` | [4](04-collector.md) |
-| Dual-write | Sending the same data to two destinations, for example two `clickhouse` exporters for two regions | [10](10-data-model.md) |
+| Dual-write | Sending the same data to two destinations, for example two `clickhouse` exporters for two regions | [10](08-data-model.md) |
 
 ### E
 
@@ -288,12 +288,12 @@ letter, ignoring backticks and symbols.
 |---|---|---|
 | Edge (LangGraph) | A connection that says which node runs next | [2](02-langgraph.md) |
 | Endpoint | An address a program answers on: host and port, sometimes a path | [4](04-collector.md), [12](12-operations.md) |
-| Environment | A separate place where software runs, such as dev, staging or prod, or another region or cloud account | [8](08-cross-environment.md) |
+| Environment | A separate place where software runs, such as dev, staging or prod, or another region or cloud account | [8](06-cross-environment.md) |
 | `error_mode: ignore` | Filter setting: if a rule can't be evaluated, log it and carry on | [4](04-collector.md) |
 | Eval (evaluation) | A quality score for a turn or span ("was the answer good?"), usually added later, with `gen_ai.evaluation.*` attributes | [3](03-genai-semconv.md) |
-| Event (span event) | A timestamped point inside a span, such as an `exception` with a stack trace | [1](01-otel-core.md), [10](10-data-model.md) |
+| Event (span event) | A timestamped point inside a span, such as an `exception` with a stack trace | [1](01-otel-core.md), [10](08-data-model.md) |
 | `execute_tool` | GenAI span for one tool call, named `execute_tool {tool name}` | [3](03-genai-semconv.md) |
-| `EXPLAIN indexes = 1` | ClickHouse command that shows how many parts and granules each index skipped | [7](07-sharding-indexes.md) |
+| `EXPLAIN indexes = 1` | ClickHouse command that shows how many parts and granules each index skipped | [7](09-sharding-indexes.md) |
 | Exporter (SDK) | The part of the SDK that sends spans out, here `OTLPSpanExporter` over HTTP | [1](01-otel-core.md) |
 | Exporter (Collector) | The part of a Collector that sends data on, such as `clickhouse` | [4](04-collector.md) |
 | Exporter helper | Queue, retry and timeout settings that every Collector exporter shares | [4](04-collector.md) |
@@ -305,10 +305,10 @@ letter, ignoring backticks and symbols.
 | Term | Meaning | Module |
 |---|---|---|
 | `FakeChatModel` | This repo's stand-in for an LLM: fakes latency and token usage, so no API key is needed | [2](02-langgraph.md) |
-| FETCH / ATTACH PARTITION | ClickHouse statements that download a partition from another replicated table, then add it to this one | [10](10-data-model.md) |
+| FETCH / ATTACH PARTITION | ClickHouse statements that download a partition from another replicated table, then add it to this one | [10](08-data-model.md) |
 | `file_storage` | Collector extension that keeps data on disk; with `sending_queue.storage`, the queue survives restarts | [4](04-collector.md) |
 | `filter` processor | Collector processor that drops data matching a rule. Here it drops spans whose resource lacks `org.owner` or `org.service` | [4](04-collector.md) |
-| FINAL | ClickHouse query keyword that removes duplicates at read time, for ReplacingMergeTree tables. Exact but slower | [10](10-data-model.md) |
+| FINAL | ClickHouse query keyword that removes duplicates at read time, for ReplacingMergeTree tables. Exact but slower | [10](08-data-model.md) |
 | Finish reasons | `gen_ai.response.finish_reasons`: why the model stopped, such as `stop` or a length limit | [3](03-genai-semconv.md) |
 | Flags (trace flags) | The last field of `traceparent`. `01` means sampled; `02` means the trace id is random | [1](01-otel-core.md) |
 | Freshness | Age of the newest stored span: the first sign that ingestion has stalled | [12](12-operations.md) |
@@ -321,8 +321,8 @@ letter, ignoring backticks and symbols.
 | Gateway | A Collector that runs centrally, that every app sends to. Here, the `otel-gateway` container | [4](04-collector.md) |
 | Gauge | A metric that goes up and down, like a fuel gauge: queue size, memory, free disk | [12](12-operations.md) |
 | GenAI semantic conventions | OpenTelemetry's standard names for AI workloads. Status: development, so names can still change | [3](03-genai-semconv.md) |
-| Granule | A block of 8192 rows in a ClickHouse part; the smallest unit an index can skip | [6](06-clickhouse.md) |
-| GRANULARITY | Skip index setting: how many granules one index entry covers | [7](07-sharding-indexes.md) |
+| Granule | A block of 8192 rows in a ClickHouse part; the smallest unit an index can skip | [6](07-clickhouse.md) |
+| GRANULARITY | Skip index setting: how many granules one index entry covers | [7](09-sharding-indexes.md) |
 | gRPC | A network protocol for calling services, one of the two ways to send OTLP (port 4317) | [1](01-otel-core.md), [4](04-collector.md) |
 
 ### H
@@ -333,18 +333,18 @@ letter, ignoring backticks and symbols.
 | Header (HTTP) | A named value sent with an HTTP request, such as `traceparent` | [1](01-otel-core.md) |
 | Health check | An endpoint that says whether a program is alive. The gateway's is on port 13133 | [4](04-collector.md), [12](12-operations.md) |
 | Histogram | A metric that counts values in buckets, so you can see their spread | [12](12-operations.md) |
-| Hot shard | A shard that gets far more load than the others, for example from sharding by time or service | [7](07-sharding-indexes.md) |
+| Hot shard | A shard that gets far more load than the others, for example from sharding by time or service | [7](09-sharding-indexes.md) |
 
 ### I
 
 | Term | Meaning | Module |
 |---|---|---|
 | IAM role | A cloud identity attached to a machine or pod, so programs get credentials without key files | [11](11-s3-tiering.md) |
-| Index (ClickHouse) | A structure that lets a query skip data. The main one is the sparse primary index; skip indexes are extra | [6](06-clickhouse.md), [7](07-sharding-indexes.md) |
+| Index (ClickHouse) | A structure that lets a query skip data. The main one is the sparse primary index; skip indexes are extra | [6](07-clickhouse.md), [7](09-sharding-indexes.md) |
 | Inject | Writing trace context into outgoing headers (`propagate.inject`) | [1](01-otel-core.md) |
-| `insert_quorum` | ClickHouse setting that makes an insert wait until N replicas have it | [6](06-clickhouse.md) |
+| `insert_quorum` | ClickHouse setting that makes an insert wait until N replicas have it | [6](07-clickhouse.md) |
 | Instrumentation | Code that creates telemetry, by hand or automatically | [1](01-otel-core.md) |
-| Instrumentation scope | The name (and version) of the library that created a span; here `agent-tracing`. Stored as `ScopeName` | [10](10-data-model.md) |
+| Instrumentation scope | The name (and version) of the library that created a span; here `agent-tracing`. Stored as `ScopeName` | [10](08-data-model.md) |
 | `invoke_agent` | GenAI span for one agent's run, named `invoke_agent {agent name}` | [3](03-genai-semconv.md) |
 | `invoke_workflow` | GenAI span for a whole graph run, named `invoke_workflow {workflow}` | [3](03-genai-semconv.md) |
 
@@ -352,7 +352,7 @@ letter, ignoring backticks and symbols.
 
 | Term | Meaning | Module |
 |---|---|---|
-| Keeper (ClickHouse Keeper) | The coordination service that holds replication metadata (which parts exist, the log, the DDL queue), never the data. Like a notary, not a warehouse | [6](06-clickhouse.md) |
+| Keeper (ClickHouse Keeper) | The coordination service that holds replication metadata (which parts exist, the log, the DDL queue), never the data. Like a notary, not a warehouse | [6](07-clickhouse.md) |
 | Kind (span kind) | Who is calling whom: `INTERNAL`, `CLIENT`, `SERVER`, `PRODUCER`, `CONSUMER` | [1](01-otel-core.md) |
 
 ### L
@@ -368,49 +368,49 @@ letter, ignoring backticks and symbols.
 | Leader / follower | Roles in a Keeper ensemble: the leader handles writes, followers copy it. A single node is `standalone` | [12](12-operations.md) |
 | LLM | Large language model: the AI model the agent sends prompts to. Faked here | [0](00-setup.md) |
 | `loadbalancing` exporter | Collector exporter that sends every span of a trace to the same next-tier Collector, by hashing the trace id | [5](05-sampling.md) |
-| LowCardinality | ClickHouse type for strings with few distinct values; stores them as a dictionary of codes | [10](10-data-model.md) |
+| LowCardinality | ClickHouse type for strings with few distinct values; stores them as a dictionary of codes | [10](08-data-model.md) |
 
 ### M
 
 | Term | Meaning | Module |
 |---|---|---|
-| Macro | A per-server value such as `{shard}` or `{replica}`, from `clickhouse/macros-0N.xml` | [6](06-clickhouse.md) |
-| Map column | A ClickHouse column holding key-value pairs. `SpanAttributes` and `ResourceAttributes` are maps, and every value is a string | [10](10-data-model.md) |
-| Mark | One entry of the sparse primary index, one per granule | [6](06-clickhouse.md) |
-| MATERIALIZE INDEX / COLUMN | Statements that build a new index or column for old parts, as a mutation | [7](07-sharding-indexes.md), [10](10-data-model.md) |
-| MATERIALIZED column | A column computed from other columns on insert and stored; it isn't in `SELECT *` and can't be inserted into | [10](10-data-model.md) |
-| Materialized view | A ClickHouse insert trigger: runs its `SELECT` on each inserted block and writes the result to another table | [6](06-clickhouse.md), [10](10-data-model.md) |
+| Macro | A per-server value such as `{shard}` or `{replica}`, from `clickhouse/macros-0N.xml` | [6](07-clickhouse.md) |
+| Map column | A ClickHouse column holding key-value pairs. `SpanAttributes` and `ResourceAttributes` are maps, and every value is a string | [10](08-data-model.md) |
+| Mark | One entry of the sparse primary index, one per granule | [6](07-clickhouse.md) |
+| MATERIALIZE INDEX / COLUMN | Statements that build a new index or column for old parts, as a mutation | [7](09-sharding-indexes.md), [10](08-data-model.md) |
+| MATERIALIZED column | A column computed from other columns on insert and stored; it isn't in `SELECT *` and can't be inserted into | [10](08-data-model.md) |
+| Materialized view | A ClickHouse insert trigger: runs its `SELECT` on each inserted block and writes the result to another table | [6](07-clickhouse.md), [10](08-data-model.md) |
 | `max_elapsed_time` | How long the exporter keeps retrying one batch before dropping it: 300 s here | [4](04-collector.md) |
 | `memory_limiter` | First Collector processor: refuses new data when memory is high (limit 512 MiB here) | [4](04-collector.md) |
-| Merge | ClickHouse combining small parts into bigger ones in the background. Like gluing small Lego bricks into big ones | [6](06-clickhouse.md) |
-| MergeTree | ClickHouse's main family of table engines: inserts write sorted parts that are merged later | [6](06-clickhouse.md) |
+| Merge | ClickHouse combining small parts into bigger ones in the background. Like gluing small Lego bricks into big ones | [6](07-clickhouse.md) |
+| MergeTree | ClickHouse's main family of table engines: inserts write sorted parts that are merged later | [6](07-clickhouse.md) |
 | Metric | A named number a program reports about itself, such as "spans sent" or "memory in use" | [12](12-operations.md) |
 | `mntr` / `ruok` | Keeper's four-letter commands: `ruok` ("are you OK?") answers `imok`; `mntr` returns metrics | [12](12-operations.md) |
 | `move_factor` | Storage policy setting: when the local volume has less than this share free (0.1 = 10%), move the largest parts to the next volume | [11](11-s3-tiering.md) |
-| Mutation | A ClickHouse background job that rewrites existing parts | [7](07-sharding-indexes.md), [12](12-operations.md) |
+| Mutation | A ClickHouse background job that rewrites existing parts | [7](09-sharding-indexes.md), [12](12-operations.md) |
 
 ### N
 
 | Term | Meaning | Module |
 |---|---|---|
 | Namespace (attributes) | The prefix that groups attribute names, such as `gen_ai.` or this repo's own `org.` | [3](03-genai-semconv.md) |
-| Nested | ClickHouse type that stores a list of records as parallel arrays; used for span events and links | [10](10-data-model.md) |
+| Nested | ClickHouse type that stores a list of records as parallel arrays; used for span events and links | [10](08-data-model.md) |
 | Node (LangGraph) | A function in the graph that takes the state and returns an update, such as `hr_assistant` | [2](02-langgraph.md) |
-| Non-agentic service | Any callee without an LLM, such as an HTTP API. It joins the trace by continuing the trace id it receives | [1](01-otel-core.md), [8](08-cross-environment.md) |
+| Non-agentic service | Any callee without an LLM, such as an HTTP API. It joins the trace by continuing the trace id it receives | [1](01-otel-core.md), [8](06-cross-environment.md) |
 
 ### O
 
 | Term | Meaning | Module |
 |---|---|---|
 | `ocb` | OpenTelemetry Collector Builder: a tool to build your own slim Collector distribution | [4](04-collector.md) |
-| ON CLUSTER | Runs a ClickHouse DDL statement on every node of a cluster, through Keeper's DDL queue | [6](06-clickhouse.md), [10](10-data-model.md) |
+| ON CLUSTER | Runs a ClickHouse DDL statement on every node of a cluster, through Keeper's DDL queue | [6](07-clickhouse.md), [10](08-data-model.md) |
 | OOM | Out of memory: a process used more than allowed, and the operating system killed it | [12](12-operations.md) |
 | Operational readiness | Being able to run a system day to day: you see its health, hear about trouble early, and know what to do | [12](12-operations.md) |
-| `ORDER BY` (sorting key) | The order of rows inside each ClickHouse part, and the basis of the sparse primary index. Here `(org_owner, org_service, SpanName, time)` | [6](06-clickhouse.md) |
+| `ORDER BY` (sorting key) | The order of rows inside each ClickHouse part, and the basis of the sparse primary index. Here `(org_owner, org_service, SpanName, time)` | [6](07-clickhouse.md) |
 | `org.*` labels | This repo's own attributes: `org.owner`, `org.service` (set by apps), `org.env`, `org.region`, `org.platform`, `org.cluster` (set by the gateway), `org.tenant`, `org.request_id` (per request) | [1](01-otel-core.md), [4](04-collector.md) |
 | Orphan span | A span whose parent was never recorded, usually because services sampled inconsistently | [5](05-sampling.md) |
-| `otel_traces` | The main table: one row per span; a trace is all rows with one `TraceId` | [10](10-data-model.md) |
-| `otel_traces_trace_id_ts` | Lookup table filled by a materialized view: trace id to start and end time, so a trace query can narrow the time range | [6](06-clickhouse.md), [7](07-sharding-indexes.md) |
+| `otel_traces` | The main table: one row per span; a trace is all rows with one `TraceId` | [10](08-data-model.md) |
+| `otel_traces_trace_id_ts` | Lookup table filled by a materialized view: trace id to start and end time, so a trace query can narrow the time range | [6](07-clickhouse.md), [7](09-sharding-indexes.md) |
 | `otelcol-contrib` | The Collector distribution with hundreds of components, including the ClickHouse exporter | [4](04-collector.md) |
 | OTLP | OpenTelemetry Protocol: the standard format for sending telemetry, as protobuf over HTTP (port 4318) or gRPC (4317) | [1](01-otel-core.md) |
 | OTTL | OpenTelemetry Transformation Language: short conditions and statements used by processors such as `filter` | [4](04-collector.md) |
@@ -422,15 +422,15 @@ letter, ignoring backticks and symbols.
 | p95 (percentile) | The value 95% of measurements are below; 1 in 20 is slower | [12](12-operations.md) |
 | Parent span id | The id of the span that caused this one; it turns a flat list into a tree. Empty on the root. Like "who's your parent" in a family tree | [1](01-otel-core.md) |
 | Parent-based sampler | A sampler that does what the parent did: keep the span if the parent was kept. Keeps traces whole | [5](05-sampling.md) |
-| Part | An immutable chunk of a ClickHouse table on disk: a folder of sorted column files. Every insert creates one | [6](06-clickhouse.md) |
+| Part | An immutable chunk of a ClickHouse table on disk: a folder of sorted column files. Every insert creates one | [6](07-clickhouse.md) |
 | Parts per partition | Number of active parts in one partition. Inserts are delayed at 1000 and rejected at 3000; alert well before | [12](12-operations.md) |
-| Partition | A group of parts that's managed together; here one per day (`PARTITION BY toDate(Timestamp)`). Parts never merge across partitions | [6](06-clickhouse.md) |
+| Partition | A group of parts that's managed together; here one per day (`PARTITION BY toDate(Timestamp)`). Parts never merge across partitions | [6](07-clickhouse.md) |
 | Persistent queue | An export queue kept on disk (`sending_queue.storage`), so a gateway restart doesn't lose it | [4](04-collector.md), [12](12-operations.md) |
 | Pipeline | One wired-up path in a Collector: receivers, then processors in order, then exporters | [4](04-collector.md) |
 | Play UI | ClickHouse's browser page for running SQL, at <http://localhost:8123/play> | [0](00-setup.md) |
 | Policy (tail sampling) | A rule that says which traces to keep, such as "has an error" or "slower than 1.5 s" | [5](05-sampling.md) |
 | Processor | A Collector step that changes, drops, groups or samples data, in order | [4](04-collector.md) |
-| Projection | A hidden second copy of a ClickHouse table's data inside each part, sorted another way | [7](07-sharding-indexes.md) |
+| Projection | A hidden second copy of a ClickHouse table's data inside each part, sorted another way | [7](09-sharding-indexes.md) |
 | Prometheus | A monitoring system that scrapes metrics from HTTP pages and stores them. The gateway publishes its metrics in Prometheus format | [12](12-operations.md) |
 | Propagation | Carrying trace context between processes in request headers (`traceparent`, `baggage`) | [1](01-otel-core.md) |
 | Protobuf | Protocol Buffers: a compact binary format; OTLP uses it | [1](01-otel-core.md) |
@@ -442,25 +442,25 @@ letter, ignoring backticks and symbols.
 | Term | Meaning | Module |
 |---|---|---|
 | Queue | A waiting line for work. A queue that keeps growing means the next step can't keep up | [4](04-collector.md), [12](12-operations.md) |
-| `queue_size` (replication) | Column in `system.replicas`: replication tasks a replica still has to do | [6](06-clickhouse.md), [12](12-operations.md) |
-| Quorum (majority) | More than half the members. Keeper needs a majority to work: 2 of 3, or 3 of 5 | [6](06-clickhouse.md) |
+| `queue_size` (replication) | Column in `system.replicas`: replication tasks a replica still has to do | [6](07-clickhouse.md), [12](12-operations.md) |
+| Quorum (majority) | More than half the members. Keeper needs a majority to work: 2 of 3, or 3 of 5 | [6](07-clickhouse.md) |
 
 ### R
 
 | Term | Meaning | Module |
 |---|---|---|
-| Raft | The agreement algorithm Keeper uses so its nodes agree on the same metadata | [6](06-clickhouse.md) |
+| Raft | The agreement algorithm Keeper uses so its nodes agree on the same metadata | [6](07-clickhouse.md) |
 | Rate | How much a counter grew per second over a time window | [12](12-operations.md) |
-| Read-only replica | A table copy that answers queries but refuses inserts, usually because it lost contact with Keeper (`Code: 242 TABLE_IS_READ_ONLY`) | [6](06-clickhouse.md), [12](12-operations.md) |
+| Read-only replica | A table copy that answers queries but refuses inserts, usually because it lost contact with Keeper (`Code: 242 TABLE_IS_READ_ONLY`) | [6](07-clickhouse.md), [12](12-operations.md) |
 | Receiver | The part of a Collector that accepts incoming data; here `otlp` | [4](04-collector.md) |
-| RED | Rate, errors, duration: the three basic service metrics. `span_red_1m` stores them per minute | [3](03-genai-semconv.md), [10](10-data-model.md) |
+| RED | Rate, errors, duration: the three basic service metrics. `span_red_1m` stores them per minute | [3](03-genai-semconv.md), [10](08-data-model.md) |
 | Reducer | LangGraph rule for merging a node's update into the state, such as `add_messages` (append, don't replace) | [2](02-langgraph.md) |
 | Refused spans | Spans the gateway's `memory_limiter` turned away; the app must retry | [12](12-operations.md) |
-| `remote()` | ClickHouse function that reads a table on another server; `INSERT ... SELECT FROM remote()` copies it | [8](08-cross-environment.md), [10](10-data-model.md) |
-| ReplacingMergeTree | ClickHouse engine that keeps one row per sorting key, eventually: duplicates disappear when parts merge. Used by `trace_entry` | [10](10-data-model.md) |
-| Replica | One copy of a table. Adds availability and read capacity | [6](06-clickhouse.md), [7](07-sharding-indexes.md) |
-| ReplicatedMergeTree | MergeTree that keeps copies on several servers, coordinated by Keeper | [6](06-clickhouse.md) |
-| Replication | Keeping copies in sync. Here, a new part is logged in Keeper and the other replica downloads it from its peer | [6](06-clickhouse.md) |
+| `remote()` | ClickHouse function that reads a table on another server; `INSERT ... SELECT FROM remote()` copies it | [8](06-cross-environment.md), [10](08-data-model.md) |
+| ReplacingMergeTree | ClickHouse engine that keeps one row per sorting key, eventually: duplicates disappear when parts merge. Used by `trace_entry` | [10](08-data-model.md) |
+| Replica | One copy of a table. Adds availability and read capacity | [6](07-clickhouse.md), [7](09-sharding-indexes.md) |
+| ReplicatedMergeTree | MergeTree that keeps copies on several servers, coordinated by Keeper | [6](07-clickhouse.md) |
+| Replication | Keeping copies in sync. Here, a new part is logged in Keeper and the other replica downloads it from its peer | [6](07-clickhouse.md) |
 | Resource | Who sent the span: `service.name`, `org.owner`, `org.service`. Set once per process. Resource = who, attributes = what | [1](01-otel-core.md) |
 | `resource` processor | Collector processor that edits resource labels; here it stamps the platform labels | [4](04-collector.md) |
 | Retry | Trying again after a failure; the SDK and the exporter both do it | [4](04-collector.md) |
@@ -486,19 +486,19 @@ letter, ignoring backticks and symbols.
 | Sending queue | A waiting area in front of a Collector exporter, holding batches until they're sent: 1000 batches, in memory, here | [4](04-collector.md) |
 | Server span | A span of kind `SERVER`: "I answered a call". Its parent is the caller's client span | [1](01-otel-core.md) |
 | Session | A conversation of many turns, linked by `gen_ai.conversation.id`; not one trace | [3](03-genai-semconv.md) |
-| Shard | A slice of the data on its own servers. Adds storage and write capacity | [7](07-sharding-indexes.md) |
-| Sharding key | The expression that picks a row's shard, here `cityHash64(TraceId)` | [7](07-sharding-indexes.md) |
+| Shard | A slice of the data on its own servers. Adds storage and write capacity | [7](09-sharding-indexes.md) |
+| Sharding key | The expression that picks a row's shard, here `cityHash64(TraceId)` | [7](09-sharding-indexes.md) |
 | Sidecar | A helper container running next to an app, such as an agent Collector | [4](04-collector.md) |
-| Skip index | A ClickHouse index (`minmax`, `set`, `bloom_filter`...) that lets a query skip granules that can't match. It never finds rows; it's a "not here" sign | [7](07-sharding-indexes.md) |
+| Skip index | A ClickHouse index (`minmax`, `set`, `bloom_filter`...) that lets a query skip granules that can't match. It never finds rows; it's a "not here" sign | [7](09-sharding-indexes.md) |
 | SLI | Service level indicator: a measurement of what users experience, such as span freshness | [12](12-operations.md) |
 | SLO | Service level objective: a target for an SLI, such as "newest span under 2 minutes old 99.9% of the time" | [12](12-operations.md) |
 | Span | One timed operation: name, start and end, status, kind, attributes, events, links | [1](01-otel-core.md) |
 | Span id | 16 hex characters unique to one span. In the family tree, the first name | [1](01-otel-core.md) |
-| Span link | A pointer to a span in another trace, for async, batch or trust-boundary cases; not a parent | [1](01-otel-core.md), [8](08-cross-environment.md) |
+| Span link | A pointer to a span in another trace, for async, batch or trust-boundary cases; not a parent | [1](01-otel-core.md), [8](06-cross-environment.md) |
 | Span name | A short, low-cardinality name such as `GET /v1/prices/{sku}`, never with ids in it | [1](01-otel-core.md) |
-| `span_red_1m` | Per-minute rate, errors and duration per service and span name, kept a year | [6](06-clickhouse.md), [10](10-data-model.md) |
+| `span_red_1m` | Per-minute rate, errors and duration per service and span name, kept a year | [6](07-clickhouse.md), [10](08-data-model.md) |
 | `spanmetrics` connector | Collector connector that turns spans into metrics, best placed before any sampling | [5](05-sampling.md) |
-| Sparse index | ClickHouse's primary index: one entry (mark) per granule of 8192 rows, not one per row | [6](06-clickhouse.md) |
+| Sparse index | ClickHouse's primary index: one entry (mark) per granule of 8192 rows, not one per row | [6](07-clickhouse.md) |
 | Stability level | How settled a semconv area is: HTTP is stable; GenAI is still in development | [3](03-genai-semconv.md) |
 | State (LangGraph) | A typed dict shared by all nodes, like a whiteboard. Here `TurnState` or `HrState` | [2](02-langgraph.md) |
 | Status | A span's outcome: `UNSET`, `OK` or `ERROR` | [1](01-otel-core.md) |
@@ -506,7 +506,7 @@ letter, ignoring backticks and symbols.
 | Supervisor pattern | One LangGraph node routes; worker nodes do the work and hand control back | [2](02-langgraph.md) |
 | Superstep | One round of a LangGraph run, in which the scheduled nodes execute | [2](02-langgraph.md) |
 | Synthetic trace | A fake request sent on a schedule, just to check it arrives end to end | [12](12-operations.md) |
-| System tables | ClickHouse's built-in tables about itself: `system.parts`, `system.replicas`, `system.metrics`, `system.events`, `system.query_log`... | [6](06-clickhouse.md), [12](12-operations.md) |
+| System tables | ClickHouse's built-in tables about itself: `system.parts`, `system.replicas`, `system.metrics`, `system.events`, `system.query_log`... | [6](07-clickhouse.md), [12](12-operations.md) |
 
 ### T
 
@@ -521,16 +521,16 @@ letter, ignoring backticks and symbols.
 | TLS | Transport Layer Security: encryption for network connections | [12](12-operations.md) |
 | Tokens | The units LLMs count and bill text in. `gen_ai.usage.input_tokens` and `output_tokens`, on `chat` spans only | [3](03-genai-semconv.md) |
 | Tool | A function an agent can call, such as `lookup_employee`; here tools call HTTP APIs | [2](02-langgraph.md) |
-| Too many parts | ClickHouse error when a partition has too many parts; caused by many small inserts | [6](06-clickhouse.md) |
+| Too many parts | ClickHouse error when a partition has too many parts; caused by many small inserts | [6](07-clickhouse.md) |
 | Trace | All spans that share one trace id, joined into a tree. Like a family tree | [1](01-otel-core.md) |
 | Trace id | 32 hex characters shared by every span of one request, across services. In the family tree, the surname | [1](01-otel-core.md) |
-| `trace_entry` | Table with one row per trace root or entry span: the "trace list" | [6](06-clickhouse.md), [10](10-data-model.md) |
+| `trace_entry` | Table with one row per trace root or entry span: the "trace list" | [6](07-clickhouse.md), [10](08-data-model.md) |
 | `traceparent` | W3C header carrying the version, trace id, parent span id and flags. Like a letter of introduction you carry into the next service | [1](01-otel-core.md) |
 | Tracer | The object code uses to start spans | [1](01-otel-core.md) |
 | `TracerProvider` | The SDK object that holds the resource, sampler and processors, and hands out tracers | [1](01-otel-core.md) |
-| `tracestate` | A second W3C header for vendor-specific trace data; stored as `TraceState` | [10](10-data-model.md) |
-| Trust boundary | A point where outside callers come in, such as a public API. There you may start a new trace and link to the caller's | [8](08-cross-environment.md) |
-| TTL | Time to live: a rule that deletes or moves data once it's old enough. Here, raw spans are deleted after 72 hours | [6](06-clickhouse.md) |
+| `tracestate` | A second W3C header for vendor-specific trace data; stored as `TraceState` | [10](08-data-model.md) |
+| Trust boundary | A point where outside callers come in, such as a public API. There you may start a new trace and link to the caller's | [8](06-cross-environment.md) |
+| TTL | Time to live: a rule that deletes or moves data once it's old enough. Here, raw spans are deleted after 72 hours | [6](07-clickhouse.md) |
 | TTL move | `TTL ... TO VOLUME 'cold'`: a part moves to another volume once its newest row passes the age | [11](11-s3-tiering.md) |
 | Turn | One user message and the agent's full response; one trace | [3](03-genai-semconv.md) |
 
@@ -553,14 +553,14 @@ letter, ignoring backticks and symbols.
 | Term | Meaning | Module |
 |---|---|---|
 | W3C Trace Context | The web standard that defines the `traceparent` and `tracestate` headers. W3C is the World Wide Web Consortium | [1](01-otel-core.md) |
-| WAF | Web application firewall: a filter in front of web services that can strip unknown headers | [8](08-cross-environment.md) |
+| WAF | Web application firewall: a filter in front of web services that can strip unknown headers | [8](06-cross-environment.md) |
 
 ### Z
 
 | Term | Meaning | Module |
 |---|---|---|
 | Znode | One entry in Keeper's tree of metadata, like a file in a folder tree | [12](12-operations.md) |
-| ZooKeeper | An older coordination service. Keeper speaks the same protocol, which is why ClickHouse tables mention `zookeeper` | [6](06-clickhouse.md) |
+| ZooKeeper | An older coordination service. Keeper speaks the same protocol, which is why ClickHouse tables mention `zookeeper` | [6](07-clickhouse.md) |
 
 ## Memory hooks
 
@@ -588,7 +588,7 @@ means spans that never reach ClickHouse.
 |---|---|---|
 | SDK queue full, or the process exits while the gateway is down | `Failed to export spans batch` in the app's log | Those spans (module 4 lab) |
 | Gateway down | Apps retry briefly | Spans from short-lived processes |
-| ClickHouse or Keeper down, less than 5 min | `Code: 242` (table is read-only), gateway retries | Nothing (module 6 lab) |
+| ClickHouse or Keeper down, less than 5 min | `Code: 242` (table is read-only), gateway retries | Nothing (module 7 lab) |
 | ClickHouse down, more than `max_elapsed_time` | Gateway drops batches | Batches past the retry window |
 | One replica down | `active_replicas = 1` | Nothing; it catches up |
 | Proxy strips headers | Every API span is a root | The trace's continuity |

@@ -122,9 +122,10 @@ CREATE TABLE IF NOT EXISTS otel.trace_entry ON CLUSTER tracing
     org_tenant            String,
     Duration             UInt64,
     StatusCode           LowCardinality(String),
+    IsRoot               UInt8,
     INDEX idx_trace_id TraceId TYPE bloom_filter(0.001) GRANULARITY 1
 )
-ENGINE = ReplicatedReplacingMergeTree
+ENGINE = ReplicatedReplacingMergeTree(IsRoot)
 PARTITION BY toDate(Start)
 ORDER BY (org_request_id, TraceId)
 TTL toDateTime(Start) + INTERVAL 72 HOUR
@@ -135,7 +136,8 @@ TO otel.trace_entry AS
 SELECT Timestamp AS Start, TraceId,
        org_request_id, org_agent_interface,
        org_owner, org_service, org_tenant,
-       Duration, StatusCode
+       Duration, StatusCode,
+       ParentSpanId = '' AS IsRoot
 FROM otel.otel_traces
 WHERE org_request_id != '' OR ParentSpanId = '';
 
@@ -145,8 +147,8 @@ CREATE TABLE IF NOT EXISTS otel.span_red_1m ON CLUSTER tracing
     org_owner     LowCardinality(String),
     org_service   LowCardinality(String),
     SpanName     LowCardinality(String),
-    calls        UInt64,
-    errors       UInt64,
+    calls        SimpleAggregateFunction(sum, UInt64),
+    errors       SimpleAggregateFunction(sum, UInt64),
     duration_q   AggregateFunction(quantiles(0.5, 0.95, 0.99), UInt64)
 )
 ENGINE = ReplicatedAggregatingMergeTree

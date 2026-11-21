@@ -1,14 +1,15 @@
-# Module 7: Sharding, trace locality and indexes (25 min)
+# Module 9: Sharding, trace locality and indexes (35 min)
 
 ## Why this matters
 
-Module 6 showed how two replicas keep the **same** data for safety. That
-doesn't help when you have more spans than one server can store or write.
-For that you split the data across servers, called **sharding**, and the
-way you split it decides whether a trace stays in one place or ends up
-scattered. This module also covers the extra indexes that make lookups like
-"find this trace id" fast, even though the trace id isn't in the table's
-sorting key.
+[Module 7](07-clickhouse.md) showed how two replicas keep the **same** data
+for safety. That doesn't help when you have more spans than one server can
+store or write. For that you split the data across servers, called
+**sharding**, and the way you split it decides whether a trace stays in one
+place or ends up scattered. This module also explains the skip indexes that
+[module 8](08-data-model.md) listed at the end of `otel_traces`: they make
+lookups like "find this trace id" fast, even though the trace id isn't in
+the table's sorting key.
 
 **What you'll be able to do after this module:**
 
@@ -21,11 +22,14 @@ sorting key.
 
 ## Key terms
 
+Reminders from earlier modules: a **replica** is a full copy of the data on
+another server, a **granule** is a block of 8192 rows, the smallest unit
+ClickHouse reads ([module 7](07-clickhouse.md)), and a **mutation** is a
+background job that rewrites existing parts ([module 8](08-data-model.md)).
+
 | Term | Plain meaning |
 |---|---|
-| Replica | A full **copy** of the data on another server (module 6) |
 | Shard | A **slice** of the data. Each shard holds different rows |
-| Cluster | A named list of servers, grouped into shards and replicas, in `clickhouse/cluster.xml` |
 | Local table | The ordinary table on each server that actually stores that shard's rows |
 | `Distributed` table | A table that stores nothing. It forwards inserts to shards and collects query results from them |
 | Sharding key | An expression computed for each row that decides which shard it goes to |
@@ -33,17 +37,14 @@ sorting key.
 | Trace locality | All spans of one trace stored on the same shard |
 | Hot shard | One shard getting much more data or traffic than the others |
 | Skip index | An extra index that stores a small summary per block of granules, so ClickHouse can skip blocks that can't match |
-| Bloom filter | A compact summary that answers "definitely not here" or "maybe here" for a value |
-| False positive rate | How often a bloom filter says "maybe" for a value that isn't there; `0.001` means about 1 in 1000 |
-| Granule | 8192 rows, the smallest unit ClickHouse reads (module 6) |
-| Mutation | A background job that rewrites existing parts, for example to build a new index for old data |
+| Bloom filter | A compact summary that answers "definitely not here" or "maybe here" for a value. Its false positive rate is how often "maybe" is wrong |
 | Projection | A hidden second copy of the data inside each part, sorted another way |
 
 ## Idea
 
 ### Shards and replicas
 
-**The problem.** Replication (module 6) gives you copies. Two replicas each
+**The problem.** Replication (module 7) gives you copies. Two replicas each
 hold *all* the spans, so adding replicas makes the system safer and adds
 read capacity, but every replica still has to store and write everything.
 Once spans outgrow one server's disk or write speed, more copies don't
@@ -134,7 +135,7 @@ Two details you'll meet in the lab and config:
   has reached its shard, and the counts you query right after are complete.
 - `<internal_replication>true</internal_replication>` in `cluster.xml`
   means: when a shard has several replicas, write each row to just one of
-  them and let replication (module 6) copy it. Without it, the
+  them and let replication (module 7) copy it. Without it, the
   `Distributed` table would write to every replica itself.
 
 **Why this repo has no `Distributed` tables.** The `tracing` cluster has one
@@ -144,7 +145,7 @@ into `otel_traces`, and replication copies it. The comment at the top of
 
 ### Why `cityHash64(TraceId)` keeps a trace together
 
-Follow the HR example from module 6. One user question to the HR assistant
+Follow the HR example from module 7. One user question to the HR assistant
 produces spans from `hr-agent` (the turn, the agent, the model and tool
 calls) and from `ticket-api` (its HTTP span). They arrive at the gateway
 separately, from two different services, possibly seconds apart and in
@@ -173,6 +174,15 @@ Compare the alternatives:
   services, so traces get split. And one busy service overloads its shard
   (a **hot shard**).
 
+**Changing the number of shards later is painful.** The shard is the hash
+modulo the shard count, so going from 2 to 3 shards changes the answer for
+about two thirds of all trace ids, not just a third. Existing rows don't move
+by themselves: they stay where they were written, and a lookup computed with
+the new count asks the wrong shard. To really rebalance you copy almost every
+row again ([module 10](10-copying-data.md) covers the copying tools). So
+start with enough shards, or give a new shard a higher weight so that new
+data fills it while old data ages out with the TTL.
+
 **A production variant.** Instead of inserting through a `Distributed`
 table, a gateway tier can route by trace id itself (the `loadbalancing`
 exporter, from module 5) and write straight to each shard's local table.
@@ -180,7 +190,7 @@ The principle is the same: **shard by trace id**.
 
 ### Indexes you can add
 
-**The problem.** Module 6 showed the sorting key
+**The problem.** Module 7 showed the sorting key
 `(org_owner, org_service, SpanName, toDateTime(Timestamp))`. It makes
 "this team's service" queries fast. But the most common trace query,
 "show me trace `4bf9...`", filters on `TraceId`, which isn't in the key.
@@ -194,15 +204,16 @@ sorted one way. For other filters, ClickHouse offers several tools:
 |---|---|---|
 | **Sorting key** (`ORDER BY`) | Sparse primary index; the only physical order | Your most common filters (here: owner, service, span name, time) |
 | **MATERIALIZED column** | Pulls a value out of a map into a real column on insert | Map keys you filter or group by often |
-| **Skip index** `minmax` | Min and max per index block | Ranges on values that rise with time or cluster (duration) |
-| **Skip index** `set(N)` | Up to N distinct values per block | Low-cardinality columns (agent name) |
-| **Skip index** `bloom_filter` | "Definitely not here" or "maybe here" per block | Equality on high-cardinality ids (trace id, request id, tenant) |
+| **Skip index** `minmax` | Min and max per index block | Ranges on values that are clustered by the sorting key or by insert time |
+| **Skip index** `set(N)` | Up to N distinct values per block | Equality on a few values that sit together in the sort order, so most blocks lack them |
+| **Skip index** `bloom_filter` | "Definitely not here" or "maybe here" per block | Equality on rare values like ids (trace id, request id, conversation id) |
 | `tokenbf_v1`, `ngrambf_v1` | Bloom filters over words or n-grams (short runs of characters) | Searching inside text |
 | **Projection** | A second, hidden copy of the data inside each part, in another order | A second access pattern, e.g. `ORDER BY TraceId` |
 | **Lookup table + MV** | A small table fed by a materialized view | Here, `otel_traces_trace_id_ts`: trace id to time range |
 
-(A MATERIALIZED column is explained fully in module 10; MV means
-materialized view, the insert trigger from module 6.)
+(MATERIALIZED columns and the lookup table were covered in
+[module 8](08-data-model.md); MV means materialized view, the insert trigger
+from module 7.)
 
 ### How a skip index works
 
@@ -228,21 +239,68 @@ The three main kinds, with what the summary holds:
   **definitely not** in the block; if all are on, it **might** be. The
   number in `bloom_filter(0.001)` is the false positive rate: about 1 "maybe"
   in 1000 is wrong, and those blocks get read for nothing. A lower rate
-  means a bigger filter. This repo has bloom filters on `TraceId`, the
-  request id, the tenant, the conversation id, and the keys and values of
-  both attribute maps.
+  means a bigger filter.
 
 An index's `GRANULARITY` sets the block size, in granules: `GRANULARITY 1`
 means one summary per granule (8192 rows); `GRANULARITY 4` means one
 summary per 4 granules (4 x 8192 rows).
 
-**When a skip index helps, and when it doesn't.** It only helps if the value
-you search for is **rare or clustered**: present in a few blocks and absent
-from the rest. A trace id appears in a handful of granules out of thousands,
-so a bloom filter skips nearly everything. An agent name that appears in
-every granule can't be ruled out anywhere, so the index skips nothing and
-just costs time. Always check with `EXPLAIN indexes = 1` that the index
-actually skips something.
+### The indexes in `schema.sql`
+
+These are the `INDEX` lines at the end of the `otel_traces` column list:
+
+```sql
+INDEX idx_trace_id   TraceId                TYPE bloom_filter(0.001) GRANULARITY 1,
+INDEX idx_request_id org_request_id         TYPE bloom_filter(0.001) GRANULARITY 1,
+INDEX idx_tenant     org_tenant             TYPE bloom_filter(0.01)  GRANULARITY 1,
+INDEX idx_conv_id    gen_ai_conversation_id TYPE bloom_filter(0.001) GRANULARITY 1,
+INDEX idx_res_keys   mapKeys(ResourceAttributes)   TYPE bloom_filter(0.01) GRANULARITY 1,
+INDEX idx_res_vals   mapValues(ResourceAttributes) TYPE bloom_filter(0.01) GRANULARITY 1,
+INDEX idx_span_keys  mapKeys(SpanAttributes)       TYPE bloom_filter(0.01) GRANULARITY 1,
+INDEX idx_span_vals  mapValues(SpanAttributes)     TYPE bloom_filter(0.01) GRANULARITY 1,
+INDEX idx_duration   Duration               TYPE minmax GRANULARITY 1
+```
+
+- The first four are **bloom filters on ids**: trace, request, tenant and
+  conversation. `0.001` (1 in 1000) is used for ids you look up exactly;
+  `0.01` for the tenant, which makes that filter smaller.
+- The next four are bloom filters on **map keys and values**. They help
+  queries like `WHERE SpanAttributes['db.system.name'] = 'postgresql'` skip
+  granules where that key or value never appears, even for attributes that
+  weren't promoted to columns.
+- The last is a **`minmax`** on `Duration`: the shortest and longest span per
+  granule, so "spans slower than 5 seconds" skips granules of fast spans.
+- All use `GRANULARITY 1`: one summary per granule.
+
+The two other indexes in the file sit on the derived tables: a bloom filter
+on `TraceId` in `otel_traces_trace_id_ts` and in `trace_entry`.
+
+### When a skip index helps, and when it doesn't
+
+It only helps if the value you search for is **rare or clustered**: present
+in a few blocks and absent from the rest.
+
+- **Rare**: a trace id appears in a handful of granules out of thousands, so
+  a bloom filter skips nearly everything.
+- **Clustered**: rows are stored in sorting-key order, so a value that
+  follows the sorting key sits in a few neighboring granules. `minmax` and
+  `set` work well on such values, because most blocks have a min, max or
+  set of values that excludes it.
+- **Neither**: a value spread over most of the data. Here the tenant comes
+  close: the support and HR agents pick a tenant at random for every turn,
+  all day, so a tenant shows up in most of their granules, and a test run
+  of `WHERE org_tenant = ...` still read 8 of 11 granules. When nothing can
+  be ruled out, the index just costs time.
+
+The agent name sits in between, which lab step 3 shows. Each agent runs in
+one service (`quoter` only in `sales-agent`), and the service is the second
+column of the sorting key, so in large merged parts an agent's rows sit
+together and a `set` index can skip the other services' blocks. But that's
+the sorting key doing the work: adding `org_service = 'sales-agent'` to the
+filter gets the same skipping from the primary index, for free. And in the
+small, fresh parts that each insert creates, every granule holds a mix of
+all services and agents, so there the index skips nothing. Always check with
+`EXPLAIN indexes = 1` that an index actually skips something.
 
 **Adding an index to an existing table** only affects parts written after
 that. To build it for old parts, run `MATERIALIZE INDEX`, which starts a
@@ -268,7 +326,7 @@ index. You can follow it in `system.mutations`.
   `minmax`); the `otel_traces_trace_id_ts` lookup table.
 - `docs/tutorial/labs/sharding.sql`: the two-shard experiment.
 
-## Lab (15 min)
+## Lab (20 min)
 
 1. **Sharding by trace id against random sharding.** The script
    `docs/tutorial/labs/sharding.sql` creates a `lab` database on both
@@ -287,28 +345,29 @@ index. You can follow it in `system.mutations`.
 
    ```text
    ┌─sharding────┬─shard─┬─spans─┬─traces─┐
-   │ by trace id │     1 │ 12281 │    980 │
-   │ by trace id │     2 │ 13783 │   1099 │
-   │ random      │     1 │ 12980 │   2079 │
-   │ random      │     2 │ 13084 │   2077 │
+   │ by trace id │     1 │ 25762 │   2068 │
+   │ by trace id │     2 │ 25940 │   2087 │
+   │ random      │     1 │ 25965 │   4134 │
+   │ random      │     2 │ 25737 │   4134 │
    ┌─sharding────┬─traces─┬─traces_split_across_shards─┐
-   │ by trace id │   2079 │                          0 │
-   │ random      │   2079 │                       2077 │
+   │ by trace id │   4155 │                          0 │
+   │ random      │   4155 │                       4113 │
    ┌─spans_in_trace─┐
-   │             16 │
+   │             10 │
    ```
 
    How to read it (your numbers will differ):
 
    - **First table**: spans and distinct traces per shard. Both keys spread
      spans about evenly. With the trace-id key, each shard holds about
-     half of the traces (980 + 1099 = 2079). With `rand()`, each shard
-     holds pieces of almost every trace (2079 and 2077).
+     half of the traces (2068 + 2087 = 4155). With `rand()`, each shard
+     holds pieces of almost every trace (4134 of 4155 on each).
    - **Second table**: how many traces have spans on more than one shard.
      With the trace-id key, **none are split**. With `rand()`, almost every
-     trace is on both shards.
+     trace is on both shards; the few that aren't are tiny traces that
+     landed on one shard by chance.
    - **Third table**: a single-shard trace lookup on the trace-id table
-     worked, and found that trace's 16 spans. (`shardNum()`, used in the
+     worked, and found that trace's 10 spans. (`shardNum()`, used in the
      script, returns the number of the shard a row came from.)
 
    Now try the single-shard lookup on the random table.
@@ -333,7 +392,17 @@ index. You can follow it in `system.mutations`.
    with OTLP's `AnyValue`, the protobuf type that lets an attribute value be a
    string, number, boolean, list or map.
 
-   Clean up: `DROP DATABASE lab ON CLUSTER lab_2shards SYNC`.
+   Clean up the four lab tables:
+
+   ```sql
+   DROP TABLE lab.spans_by_trace       ON CLUSTER lab_2shards SYNC;
+   DROP TABLE lab.spans_random         ON CLUSTER lab_2shards SYNC;
+   DROP TABLE lab.spans_by_trace_local ON CLUSTER lab_2shards SYNC;
+   DROP TABLE lab.spans_random_local   ON CLUSTER lab_2shards SYNC;
+   ```
+
+   (The script's last comment drops the whole `lab` database instead. That
+   also works, but it removes any other scratch tables you keep there.)
 
 2. **See the trace-id bloom filter skip granules.** `EXPLAIN indexes = 1`
    doesn't run the query; it shows which indexes ClickHouse would use, and
@@ -349,8 +418,8 @@ index. You can follow it in `system.mutations`.
    skip indexes), each with how many parts and granules are still selected
    out of the total. The `PrimaryKey` step can't narrow anything, because
    `TraceId` isn't in the sorting key. Under `Skip`, `Name: idx_trace_id`
-   shows far fewer parts and granules; a test run read 1 of 6 parts and 3
-   of 9 granules.
+   shows far fewer parts and granules; a test run read 2 of 6 parts and 2
+   of 11 granules.
 
 3. **Add your own index, measure it, drop it.** This adds a `set(100)`
    index on the agent name to both servers, builds it for existing parts,
@@ -368,20 +437,29 @@ index. You can follow it in `system.mutations`.
    ALTER TABLE otel.otel_traces ON CLUSTER tracing DROP INDEX idx_agent_name;
    ```
 
-   Wait for `is_done = 1` before running the `EXPLAIN`. With only a few
-   thousand spans per part, the index skips little (6 of 7 granules read in
-   a test run). Agent names appear in every granule here, so the index can't
-   rule many out. **That's the lesson**: an index only pays off when the
-   value is rare or clustered across granules. Compare with a filter on the
-   sorting key:
+   The mutation is quick on this small table: run the `system.mutations`
+   query again until it shows `is_done = 1` (a few seconds in a test run),
+   then run the `EXPLAIN`. Under `Skip`, `Name: idx_agent_name` read 4 of
+   11 granules in a test run with traffic paused and parts merged. Run it
+   again while traffic is flowing, and the many small new parts, each a mix
+   of every agent, can't be skipped.
+
+   Why does it skip anything? `quoter` only runs in `sales-agent`, and the
+   service is in the sorting key, so `quoter`'s rows are clustered in the
+   sales-agent granules of each big part. Compare with a filter on the
+   sorting key itself:
 
    ```sql
    EXPLAIN indexes = 1 SELECT count() FROM otel.otel_traces
    WHERE org_owner = 'sales-eng' AND org_service = 'sales-agent';
    ```
 
-   This one is handled by `PrimaryKey`, with no extra index needed: owner and
-   service are the first two columns of the sorting key.
+   This one is handled by `PrimaryKey`, with no extra index (5 of 11
+   granules in the same test run): owner and service are the first two
+   columns of the sorting key. **That's the lesson**: a `set` or `minmax`
+   index pays off only when the value is clustered by the sorting key, and
+   when it is, filtering on the sorting key columns usually does the same
+   job for free. Drop the index (the last statement above) when you're done.
 
 ## Explain it back
 
@@ -390,10 +468,12 @@ index. You can follow it in `system.mutations`.
 > shards. We shard by `cityHash64(TraceId)`, so every span of a trace lands on
 > the same shard, wherever it came from. Trace lookups can then go to just one
 > shard, and per-trace work stays local. A random key would scatter traces
-> over every shard. Inside a shard, the sorting key is the main index; skip
-> indexes like bloom filters on ids and sets on low-cardinality columns only
-> let ClickHouse skip granules, so I check with `EXPLAIN indexes = 1` that
-> they actually skip something."
+> over every shard. Changing the shard count later reroutes most trace ids,
+> so it means copying the data again. Inside a shard, the sorting key is the
+> main index. Skip indexes only let ClickHouse skip granules: bloom filters
+> work for rare values like ids, `set` and `minmax` only for values clustered
+> by the sort order. I check with `EXPLAIN indexes = 1` that they actually
+> skip something."
 
 ## Recap
 
@@ -405,9 +485,13 @@ index. You can follow it in `system.mutations`.
   load evenly, and lets a trace lookup ask just one shard.
 - This repo has one shard, so it has no `Distributed` tables; the lab uses
   `lab_2shards` to show the idea.
+- The shard is the hash modulo the shard count, so changing the count later
+  reroutes most rows. Plan the shard count up front.
 - The sorting key is the only physical order. For other filters, use skip
-  indexes (`bloom_filter` for ids, `minmax` for ranges, `set` for few
-  values), projections, or a lookup table.
+  indexes (`bloom_filter` for rare values like ids, `minmax` and `set` for
+  values clustered by the sort order), projections, or a lookup table.
+- `schema.sql` has bloom filters on four ids and on the attribute maps' keys
+  and values, and a `minmax` on `Duration`.
 - Skip indexes only rule blocks out. Check with `EXPLAIN indexes = 1`, and
   run `MATERIALIZE INDEX` to build a new index for old parts.
 
@@ -447,6 +531,30 @@ materialized for old parts (`system.mutations`)? Is the value present in
 nearly every granule (then no index helps; consider the sorting key or a
 projection)? Is `GRANULARITY` too coarse?
 </details>
+
+<details><summary>A two-shard cluster is full, so you add a third shard. Why isn't that just a config change?</summary>
+
+Rows go to `hash mod shard count`. With three shards, about two thirds of
+trace ids map to a different shard than before, but their old rows stay
+where they were written. Lookups that skip unused shards would then ask the
+wrong one. You either copy the data again into the new layout, or weight the
+new shard so new data fills it while old data expires.
+</details>
+
+<details><summary>Would a <code>set</code> index on <code>org_tenant</code> help <code>WHERE org_tenant = ...</code>?</summary>
+
+Hardly. Tenants are picked at random per turn, so every tenant appears in
+most granules, and there's little to rule out. The existing bloom filter
+still read 8 of 11 granules in a test run. Indexes need rare or clustered
+values.
+</details>
+
+## Next
+
+Sharding and replication change where rows live. [Module
+10](10-copying-data.md) answers the practical follow-up: how to add a replica
+and how to copy spans between ClickHouse servers, with or without a shared
+Keeper, without losing late spans.
 
 ## Read more
 

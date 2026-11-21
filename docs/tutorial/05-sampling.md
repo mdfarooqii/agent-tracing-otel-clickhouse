@@ -1,4 +1,4 @@
-# Module 5: Head and tail sampling (45 min)
+# Module 5: Head and tail sampling (60 min)
 
 ## Why this matters
 
@@ -11,26 +11,22 @@ it costs, and how to turn each kind on in this repo.
 
 ## Key terms
 
+From earlier modules you need: a **trace** (all the spans of one request; here,
+one agent turn), its **trace id** and **root span** (`agent_turn`), the
+**`traceparent`** header that carries them between services, and the SDK's
+**sampler** ([module 1](01-otel-core.md)); and the **gateway**, the Collector
+that forwards spans to ClickHouse ([module 4](04-collector.md)).
+
 | Term | Plain meaning |
 |---|---|
-| **Span** | The record of one timed operation, such as one tool call or one HTTP request ([module 1](01-otel-core.md)) |
-| **Trace** | All the spans of one request, linked into a tree. Here, one agent turn is one trace |
-| **Trace id** | A random 32-character hex id shared by every span in a trace |
-| **Root span** | The first span of a trace, with no parent. Here, `agent_turn` |
-| **Parent span** | The span that caused this one. An API's server span has the agent's client span as its parent |
-| **`traceparent`** | The HTTP header that carries the trace id, the parent span id, and the **sampled flag** from one service to the next ([module 1](01-otel-core.md)) |
-| **Sampling** | Keeping a subset of traces and dropping the rest, on purpose |
-| **Sampling decision** | The keep-or-drop choice for one trace |
+| **Sampling** | Keeping a subset of traces and dropping the rest, on purpose. Each keep-or-drop choice is a **sampling decision** |
 | **Head sampling** | Deciding at the very start of a trace, inside the app's SDK |
 | **Tail sampling** | Deciding after the whole trace has finished, inside a Collector |
-| **Sampler** | The piece of SDK code that makes a head sampling decision |
 | **Ratio sampling** | Keeping a fixed fraction, such as 30%, chosen from the trace id |
 | **Parent-based sampling** | "Do what my parent did": follow the decision the caller already made |
 | **Orphan span** | A span whose parent was never recorded, so it hangs loose outside its tree |
 | **Policy** | One rule in tail sampling, such as "keep traces with an error" |
-| **Collector / gateway** | The separate program that receives spans and forwards them to ClickHouse ([module 4](04-collector.md)) |
 | **Load balancer** | Something that spreads incoming requests across several copies (replicas) of a service |
-| **RED metrics** | Rate, errors, duration: request count, error count and latency per service |
 
 ## Idea
 
@@ -106,13 +102,15 @@ travels between services in the `traceparent` header, in the last field (the
 flags). The header looks like this:
 
 ```text
-traceparent: 00-12d64ae6b9afa411e15ca3a7c1726609-01aa4e70b23ff052-03
+traceparent: 00-12d64ae6b9afa411e15ca3a7c1726609-201baf240807604d-01
              ^^ ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ ^^^^^^^^^^^^^^^^ ^^
           version          trace id               parent span id  flags
 ```
 
-If the lowest bit of the flags is set (`01` or `03`), the trace is sampled. If
-it's `00`, the caller dropped it.
+Flags `01` mean the caller sampled (kept) the trace; `00` means it dropped it.
+Only the lowest bit means "sampled". Newer versions of the standard use the
+next bit for something else (`02` says "this trace id is random"), so `03` also
+means sampled. Check the lowest bit, not the whole value.
 
 The Python SDK picks its sampler from environment variables, so you don't
 change any code:
@@ -134,7 +132,8 @@ gives the same answer.
 
 #### Parent-based sampling
 
-**"Parent-based" is what keeps traces whole.** Follow one HR agent turn:
+**"Parent-based" is what keeps traces whole.** Follow the HR agent's "I need a
+new laptop" turn:
 
 1. The `agent_turn` root span starts in `hr-agent`. With
    `parentbased_traceidratio` at 0.3, it's a root, so the ratio rule decides.
@@ -158,12 +157,16 @@ ratio and the same algorithm happen to make the same decision for the same
 trace. Don't rely on that coincidence: different ratios or SDKs break it.
 Use parent-based sampling in every service that isn't the start of a trace.
 
-#### Head sampling in a Collector
+#### Stateless probabilistic sampling in a Collector
 
 There's one more option in between: the `probabilistic_sampler` processor in a
-Collector also keeps a percentage of traces by trace id. Like head sampling, it
-decides without waiting and without knowing the outcome. It's useful when you
-can't change the apps' settings. This repo doesn't use it.
+Collector keeps a percentage of traces, chosen from the trace id. It isn't head
+sampling: the apps have already recorded and sent every span, so it saves
+nothing between the apps and the Collector. It isn't tail sampling either: it
+decides span by span as they pass, without holding traces in memory
+("stateless"), so it can't know whether a trace failed. Because every span of
+a trace has the same trace id, it still keeps or drops whole traces. It's
+useful when you can't change the apps' settings. This repo doesn't use it.
 
 ### Tail sampling in the Collector
 
@@ -263,7 +266,8 @@ but once the trace has left memory, a late span can be judged again on its own,
 as a fragment.
 
 **Transport cost.** Unlike head sampling, every span still travels from the app
-to the gateway. Tail sampling saves storage, not network.
+to the gateway. Tail sampling saves the network from the gateway to ClickHouse,
+and the storage there, but not the network from the apps to the gateway.
 
 **One trace, one instance.** This is the big one. With several gateway
 replicas behind a load balancer, each span is sent to whichever replica is
@@ -301,12 +305,24 @@ requests. With 10% sampling of normal traffic, 1 stored normal trace stands
 for about 10 real ones. And because tail sampling keeps *all* errors but only
 *some* successes, the stored error rate looks far higher than the real one.
 
-Two ways to deal with it:
+The numbers you usually want per service are **RED metrics**: rate (requests
+counted), errors, and duration (latency). Two ways to keep them right:
 
-- Compute rate, error and duration metrics (RED metrics) **before** sampling.
-  For example, the `spanmetrics` connector, placed in a pipeline ahead of
-  `tail_sampling`, turns every span into metrics first.
+- Compute them **before** sampling. A connector (module 4) can't sit "ahead of"
+  a processor inside one pipeline, so you use two pipelines that both receive
+  from `otlp`, and each gets every span. The first exports to the
+  `spanmetrics` connector, which turns every span into RED metrics and feeds
+  them to a metrics pipeline. The second runs `tail_sampling` and writes the
+  kept traces to ClickHouse. (Not in this repo.)
 - Or weight each stored trace by its sampling rate when you count.
+
+```mermaid
+flowchart LR
+  R[otlp receiver] --> P1["traces pipeline 1:<br/>no sampling"]
+  R --> P2["traces pipeline 2:<br/>tail_sampling, batch"]
+  P1 --> SM[spanmetrics connector] --> M["metrics pipeline"] --> MB[(metrics store)]
+  P2 --> CH[(ClickHouse)]
+```
 
 In this repo, the `otel.span_red_1m` table (calls, errors and latency per
 minute) is filled by a materialized view: a query ClickHouse runs on every
@@ -333,7 +349,7 @@ traces whole.
   merged into the gateway by `docs/tutorial/labs/compose.tail-sampling.yaml`.
   It's off unless you start the gateway with that compose file.
 
-## Lab (20 min)
+## Lab (25 min)
 
 Each experiment sets `OTEL_RESOURCE_ATTRIBUTES=lab.run=...`. The SDK adds that
 label to the resource of every span, so you can find exactly that experiment's
@@ -403,18 +419,21 @@ Run SQL in <http://localhost:8123/play> (user `default`, password `demo`).
    orphans pointing at parents that don't exist. Those 6 are the turns the
    agent dropped but the API recorded anyway.
 
-3. **Tail sampling at the gateway.** Go back to the repo root, turn the traffic
-   on, and restart the gateway with the tail sampling config:
+3. **Tail sampling at the gateway.** Go back to the repo root and turn the
+   traffic on with a round every 10 seconds instead of the default 30, so the
+   numbers are big enough to compare. Wait 2 minutes for a baseline, then
+   restart the gateway with the tail sampling config:
 
    ```bash
    cd ..
-   ./stack.sh traffic on
+   TRAFFIC_INTERVAL=10 ./stack.sh traffic on
+   sleep 120
    docker compose -f compose.yaml -f docs/tutorial/labs/compose.tail-sampling.yaml up -d otel-gateway
    ```
 
-   Wait 2 minutes, then compare traces per minute before and after the switch.
-   `traces` counts all stored traces; `with_errors` counts those with at least
-   one error span:
+   Wait 2 more minutes, then compare traces per minute before and after the
+   switch. `traces` counts all stored traces; `with_errors` counts those with
+   at least one error span:
 
    ```sql
    SELECT toStartOfMinute(Timestamp) AS m, uniqExact(TraceId) AS traces,
@@ -423,17 +442,40 @@ Run SQL in <http://localhost:8123/play> (user `default`, password `demo`).
    GROUP BY m ORDER BY m;
    ```
 
-   In a test run (traffic every 10 s), traces went from about 36 per minute
-   to about 15, and most of the kept ones had errors (the pricing API fails
-   30% of the time) or were slow. With the default 30-second traffic interval,
-   your per-minute numbers will be lower. Every kept trace
-   was **complete**, with root and API spans together. That's the point of
-   deciding per trace.
+   In a test run with `TRAFFIC_INTERVAL=10`, traces went from about 36 per
+   minute to about 15, and most of the kept ones had errors (the pricing API
+   fails 30% of the time) or were slow. Your numbers will differ a little; with
+   the default 30-second interval they'd be much lower.
 
-   Turn it off again. This restarts the gateway with only the main config:
+   Now check that every kept trace is **complete**. This query takes the
+   traces whose root span started between 90 and 30 seconds ago (old enough to
+   be decided, and after the switch), and for each one counts root spans and
+   spans whose parent is missing from the same trace:
+
+   ```sql
+   SELECT count() AS traces, countIf(roots = 1) AS with_root,
+          countIf(missing_parents = 0) AS no_missing_parent
+   FROM (
+     SELECT TraceId, countIf(ParentSpanId = '') AS roots,
+            groupArray(SpanId) AS ids, groupArray(ParentSpanId) AS parents,
+            arrayCount(p -> p != '' AND NOT has(ids, p), parents) AS missing_parents
+     FROM otel.otel_traces
+     WHERE TraceId IN (SELECT TraceId FROM otel.otel_traces WHERE ParentSpanId = ''
+                       AND Timestamp BETWEEN now() - INTERVAL 90 SECOND AND now() - INTERVAL 30 SECOND)
+     GROUP BY TraceId);
+   ```
+
+   All three numbers should be equal: every kept trace has its one root span,
+   and no span points at a parent that wasn't stored. The sampler kept or
+   dropped each trace as a whole. (Compare lab step 2, where `missing_parents`
+   would be non-zero for the orphans.)
+
+   Turn tail sampling off again, and put the traffic back to its default
+   interval:
 
    ```bash
    docker compose up -d otel-gateway
+   ./stack.sh traffic off && ./stack.sh traffic on
    ```
 
 ## Explain it back
@@ -510,6 +552,14 @@ When the Collector merges config files, lists are replaced, not appended. The
 second file's `processors: [...]` becomes the complete list, so it must include
 every processor from the main file plus `tail_sampling`.
 </details>
+
+## Next
+
+Whole traces only work if every service joins the same trace: the
+`traceparent` header that carries the sampled flag also carries the trace id.
+[Module 6](06-cross-environment.md) shows how separate services, and separate
+environments with their own gateways, end up in one trace, and what quietly
+breaks that.
 
 ## Read more
 
