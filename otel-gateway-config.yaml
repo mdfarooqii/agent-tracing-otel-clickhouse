@@ -1,0 +1,58 @@
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 512
+  batch:
+    timeout: 5s
+    send_batch_size: 1000
+  # Spans whose resource lacks the mandatory owner and service labels are dropped.
+  filter/require_org_labels:
+    error_mode: ignore
+    traces:
+      span:
+        - resource.attributes["org.owner"] == nil or resource.attributes["org.service"] == nil
+  # Platform labels describe where the gateway runs, so the gateway sets them, not the service.
+  resource/org_platform:
+    attributes:
+      - { key: org.region, value: "${env:ORG_REGION}", action: upsert }
+      - { key: org.platform, value: "${env:ORG_PLATFORM}", action: upsert }
+      - { key: org.cluster, value: "${env:ORG_CLUSTER}", action: upsert }
+      - { key: org.env, value: "${env:ORG_ENV}", action: upsert }
+
+exporters:
+  clickhouse:
+    endpoint: tcp://clickhouse-01:9000,clickhouse-02:9000?dial_timeout=10s
+    database: otel
+    username: default
+    password: demo
+    traces_table_name: otel_traces
+    # Tables come from clickhouse/schema.sql, applied by clickhouse-init.
+    create_schema: false
+    timeout: 10s
+    retry_on_failure:
+      enabled: true
+      initial_interval: 5s
+      max_interval: 30s
+      max_elapsed_time: 300s
+  debug:
+    verbosity: basic
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+service:
+  extensions: [health_check]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, filter/require_org_labels, resource/org_platform, batch]
+      exporters: [clickhouse, debug]

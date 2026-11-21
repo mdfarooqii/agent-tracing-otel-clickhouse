@@ -1,0 +1,25 @@
+{
+  "name": "Agent tracing: LangGraph + OpenTelemetry + ClickHouse",
+  "image": "mcr.microsoft.com/devcontainers/python:3.12",
+  "features": {
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {}
+  },
+  "hostRequirements": {
+    "cpus": 2,
+    "memory": "8gb"
+  },
+  "postCreateCommand": "docker compose pull --quiet",
+  "postStartCommand": "./stack.sh up",
+  "forwardPorts": [8123, 8124, 14318],
+  "portsAttributes": {
+    "8123": { "label": "ClickHouse UI", "onAutoForward": "openBrowser" },
+    "8124": { "label": "ClickHouse UI (replica 2)", "onAutoForward": "silent" },
+    "14318": { "label": "OTLP HTTP gateway", "onAutoForward": "silent" }
+  },
+  "otherPortsAttributes": { "onAutoForward": "silent" },
+  "customizations": {
+    "codespaces": {
+      "openFiles": ["README.md", "queries.sql"]
+    }
+  }
+}

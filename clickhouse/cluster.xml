@@ -1,0 +1,34 @@
+<clickhouse>
+    <!-- One shard, two replicas. Host names must match each container's hostname
+         so ON CLUSTER DDL can tell which replica it is running on. -->
+    <remote_servers replace="true">
+        <tracing>
+            <shard>
+                <internal_replication>true</internal_replication>
+                <replica>
+                    <host>clickhouse-01</host>
+                    <port>9000</port>
+                    <user>default</user>
+                    <password>demo</password>
+                </replica>
+                <replica>
+                    <host>clickhouse-02</host>
+                    <port>9000</port>
+                    <user>default</user>
+                    <password>demo</password>
+                </replica>
+            </shard>
+        </tracing>
+    </remote_servers>
+
+    <zookeeper>
+        <node>
+            <host>clickhouse-keeper</host>
+            <port>9181</port>
+        </node>
+    </zookeeper>
+
+    <distributed_ddl>
+        <path>/clickhouse/task_queue/ddl</path>
+    </distributed_ddl>
+</clickhouse>

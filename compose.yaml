@@ -1,0 +1,125 @@
+# Agent tracing stack: OTel gateway -> two-replica ClickHouse cluster.
+# Start and stop it with ./stack.sh up / ./stack.sh down.
+#
+# Images come from Docker Hub. To pull through a mirror, set REGISTRY in .env,
+# for example REGISTRY=my-mirror.example.com.
+
+name: agent-tracing-demo
+
+x-clickhouse: &clickhouse
+  image: ${REGISTRY:-docker.io}/clickhouse/clickhouse-server:25.8
+  environment:
+    CLICKHOUSE_PASSWORD: demo
+    CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+  ulimits:
+    nofile:
+      soft: 262144
+      hard: 262144
+  depends_on:
+    - clickhouse-keeper
+  healthcheck:
+    test: ["CMD", "clickhouse-client", "--password", "demo", "-q", "SELECT 1"]
+    interval: 5s
+    timeout: 3s
+    retries: 20
+  networks:
+    - agent-tracing
+  restart: unless-stopped
+
+services:
+  clickhouse-keeper:
+    image: ${REGISTRY:-docker.io}/clickhouse/clickhouse-keeper:25.8
+    container_name: clickhouse-keeper
+    hostname: clickhouse-keeper
+    volumes:
+      - ./clickhouse/keeper.xml:/etc/clickhouse-keeper/keeper_config.xml:ro
+      - keeper-data:/var/lib/clickhouse-keeper
+    networks:
+      - agent-tracing
+    restart: unless-stopped
+
+  clickhouse-01:
+    <<: *clickhouse
+    container_name: clickhouse-01
+    hostname: clickhouse-01
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    volumes:
+      - ./clickhouse/cluster.xml:/etc/clickhouse-server/config.d/cluster.xml:ro
+      - ./clickhouse/macros-01.xml:/etc/clickhouse-server/config.d/macros.xml:ro
+      - ./clickhouse/play-redirect.xml:/etc/clickhouse-server/config.d/play-redirect.xml:ro
+      - clickhouse-01-data:/var/lib/clickhouse
+
+  clickhouse-02:
+    <<: *clickhouse
+    container_name: clickhouse-02
+    hostname: clickhouse-02
+    ports:
+      - "8124:8123"
+      - "9001:9000"
+    volumes:
+      - ./clickhouse/cluster.xml:/etc/clickhouse-server/config.d/cluster.xml:ro
+      - ./clickhouse/macros-02.xml:/etc/clickhouse-server/config.d/macros.xml:ro
+      - ./clickhouse/play-redirect.xml:/etc/clickhouse-server/config.d/play-redirect.xml:ro
+      - clickhouse-02-data:/var/lib/clickhouse
+
+  clickhouse-init:
+    image: ${REGISTRY:-docker.io}/clickhouse/clickhouse-server:25.8
+    container_name: clickhouse-init
+    # Replicated tables finish initialising after the server is healthy, so wait
+    # until all four are writable on both replicas before the gateway starts inserting.
+    entrypoint: ["bash", "-c"]
+    command:
+      - |
+        set -e
+        clickhouse-client --host=clickhouse-01 --password=demo --multiquery --queries-file=/schema.sql
+        for host in clickhouse-01 clickhouse-02; do
+          until [ "$$(clickhouse-client --host=$$host --password=demo -q "SELECT countIf(NOT is_readonly) FROM system.replicas WHERE database = 'otel'" 2>/dev/null)" = 4 ]; do
+            sleep 1
+          done
+        done
+        echo "schema ready on both replicas"
+    volumes:
+      - ./clickhouse/schema.sql:/schema.sql:ro
+    depends_on:
+      clickhouse-01:
+        condition: service_healthy
+      clickhouse-02:
+        condition: service_healthy
+    networks:
+      - agent-tracing
+    restart: "no"
+
+  otel-gateway:
+    image: ${REGISTRY:-docker.io}/otel/opentelemetry-collector-contrib:0.146.1
+    container_name: otel-gateway
+    command: ["--config=/etc/otel-gateway-config.yaml"]
+    # Platform labels the gateway stamps on every span. A real deployment sets
+    # these from the environment the gateway runs in.
+    environment:
+      ORG_REGION: ${ORG_REGION:-local}
+      ORG_PLATFORM: ${ORG_PLATFORM:-docker}
+      ORG_CLUSTER: ${ORG_CLUSTER:-agent-tracing}
+      ORG_ENV: ${ORG_ENV:-dev}
+    volumes:
+      - ./otel-gateway-config.yaml:/etc/otel-gateway-config.yaml:ro
+    ports:
+      - "14317:4317"   # OTLP gRPC
+      - "14318:4318"   # OTLP HTTP
+      - "13133:13133"  # health check
+    depends_on:
+      clickhouse-init:
+        condition: service_completed_successfully
+    networks:
+      - agent-tracing
+    restart: unless-stopped
+
+volumes:
+  keeper-data:
+  clickhouse-01-data:
+  clickhouse-02-data:
+
+networks:
+  agent-tracing:
+    name: agent-tracing-demo

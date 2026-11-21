@@ -1,0 +1,18 @@
+<clickhouse>
+    <!-- A browser opening the server root lands on the Play UI. Only browser page
+         loads (GET asking for HTML) are redirected; queries sent to / are not. -->
+    <http_handlers>
+        <rule>
+            <url>/</url>
+            <methods>GET</methods>
+            <headers>
+                <accept>regex:.*text/html.*</accept>
+            </headers>
+            <handler>
+                <type>redirect</type>
+                <location>/play</location>
+            </handler>
+        </rule>
+        <defaults/>
+    </http_handlers>
+</clickhouse>
