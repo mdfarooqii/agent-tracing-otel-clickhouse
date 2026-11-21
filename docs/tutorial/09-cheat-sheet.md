@@ -54,6 +54,10 @@ check yourself against the text. If you stumble, go back to that module's
 | Span link | A pointer to a span in another trace, for async, batch or trust-boundary cases | [8](08-cross-environment.md) |
 | Non-agentic service | Any callee without an LLM; it joins the trace by continuing the trace id it receives | [8](08-cross-environment.md) |
 | `any(x)` | ClickHouse aggregate: some value of `x` from the group (not OTLP's `AnyValue` type) | [7](07-sharding-indexes.md) |
+| `otel_traces` | One row per span; a trace is all rows with one `TraceId` | [10](10-data-model.md) |
+| MATERIALIZED column | Computed from the attribute maps on insert, stored, not in `SELECT *` | [10](10-data-model.md) |
+| `remote()` | Read a table on another ClickHouse server; `INSERT ... SELECT FROM remote()` copies it | [10](10-data-model.md) |
+| Adding a replica | Same table and UUID, new `{replica}` macro: it fetches every part via Keeper | [10](10-data-model.md) |
 
 ## Memory hooks
 

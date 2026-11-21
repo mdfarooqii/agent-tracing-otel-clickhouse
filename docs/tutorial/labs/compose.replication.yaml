@@ -1,0 +1,37 @@
+# Lab: two extra ClickHouse servers for module 10.
+#   docker compose -f compose.yaml -f docs/tutorial/labs/compose.replication.yaml up -d clickhouse-03 clickhouse-solo
+# Remove them again with:
+#   docker compose -f compose.yaml -f docs/tutorial/labs/compose.replication.yaml rm -sfv clickhouse-03 clickhouse-solo
+# Paths are relative to the repo root (the first compose file's folder).
+
+services:
+  # A third replica of the `tracing` cluster: same Keeper, its own macros.
+  clickhouse-03:
+    image: ${REGISTRY:-docker.io}/clickhouse/clickhouse-server:25.8
+    container_name: clickhouse-03
+    hostname: clickhouse-03
+    environment:
+      CLICKHOUSE_PASSWORD: demo
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    ports:
+      - "8125:8123"
+    volumes:
+      - ./clickhouse/cluster.xml:/etc/clickhouse-server/config.d/cluster.xml:ro
+      - ./docs/tutorial/labs/macros-03.xml:/etc/clickhouse-server/config.d/macros.xml:ro
+    depends_on:
+      - clickhouse-keeper
+    networks:
+      - agent-tracing
+
+  # A standalone server: no Keeper, no cluster. Stands in for "another ClickHouse".
+  clickhouse-solo:
+    image: ${REGISTRY:-docker.io}/clickhouse/clickhouse-server:25.8
+    container_name: clickhouse-solo
+    hostname: clickhouse-solo
+    environment:
+      CLICKHOUSE_PASSWORD: demo
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    ports:
+      - "8126:8123"
+    networks:
+      - agent-tracing

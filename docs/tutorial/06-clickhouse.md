@@ -123,6 +123,9 @@ point of failure for writes.
 - `compose.yaml`: `clickhouse-init` applies the schema, then waits until all
   four replicated tables are writable on both nodes, before the gateway starts.
 
+Module 10 walks through every table's DDL, and shows how to add a replica or
+copy data to another ClickHouse server.
+
 ## Lab (25 min)
 
 Keep the background traffic on for this module (`./stack.sh traffic on`).

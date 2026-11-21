@@ -48,8 +48,12 @@ traffic with `./stack.sh traffic off` and `./stack.sh traffic on`.
 | 7 | [Sharding, trace locality and indexes](07-sharding-indexes.md) | 25 min | Why all spans of a trace land on one shard; skip indexes |
 | 8 | [Joining services and environments](08-cross-environment.md) | 25 min | How non-agentic services and other environments join one trace |
 | 9 | [Explain-it-back cheat sheet and glossary](09-cheat-sheet.md) | 10 min | The whole system in five minutes, from memory |
+| 10 | [The data model, the DDL, and copying between ClickHouse servers](10-data-model.md) | 35 min | Every column and table in `schema.sql`; adding a replica; copying with `remote()` |
 
 Suggested breaks: after module 3 (10 min) and after module 6 (10 min).
+
+Modules 0 to 9 take about 5 hours. Module 10 adds 35 minutes; it fits best
+right after module 6, or as a follow-up session.
 
 If you only have two hours, do modules 0, 1, 2, 4 and 6, and read the
 cheat sheet.
@@ -61,6 +65,9 @@ cheat sheet.
 | [`labs/otel-gateway-tail-sampling.yaml`](labs/otel-gateway-tail-sampling.yaml) | Module 5: tail sampling config, merged into the gateway |
 | [`labs/compose.tail-sampling.yaml`](labs/compose.tail-sampling.yaml) | Module 5: restarts the gateway with that config |
 | [`labs/sharding.sql`](labs/sharding.sql) | Module 7: two-shard experiment on the same two servers |
+| [`labs/compose.replication.yaml`](labs/compose.replication.yaml), [`labs/macros-03.xml`](labs/macros-03.xml) | Module 10: a third replica and a standalone server |
+| [`labs/add-replica.sh`](labs/add-replica.sh) | Module 10: registers the third replica, which then copies everything |
+| [`labs/hello_span.py`](labs/hello_span.py), [`labs/print_callbacks.py`](labs/print_callbacks.py) | Modules 1 and 2: spans and raw LangChain callbacks |
 
 The labs only add things (a `lab` database, an extra index you drop again,
 an extra gateway config you turn off again). `./stack.sh down --wipe` resets
