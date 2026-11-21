@@ -177,6 +177,8 @@ The APIs deliberately send different label sets, so you can see each case in the
 
 All tables are replicated across both ClickHouse nodes.
 
+Older data can also move to S3 automatically, by age or when the local disk fills up. [Module 11 of the tutorial](docs/tutorial/11-s3-tiering.md) turns this on, with a local S3-compatible server or real S3.
+
 ## Use a real model
 
 The agents use an offline fake chat model with simulated latency and token counts, so the demo needs no API keys. To use a real model, replace `chat_model()` in [`agent/graph.py`](agent/graph.py) with any LangChain chat model, for example `ChatOpenAI(model="gpt-4o-mini")`. The tracing handler needs no changes; it reads token usage, response model and finish reasons from whatever the provider returns.

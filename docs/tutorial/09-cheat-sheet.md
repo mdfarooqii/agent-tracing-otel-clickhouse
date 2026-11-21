@@ -58,6 +58,8 @@ check yourself against the text. If you stumble, go back to that module's
 | MATERIALIZED column | Computed from the attribute maps on insert, stored, not in `SELECT *` | [10](10-data-model.md) |
 | `remote()` | Read a table on another ClickHouse server; `INSERT ... SELECT FROM remote()` copies it | [10](10-data-model.md) |
 | Adding a replica | Same table and UUID, new `{replica}` macro: it fetches every part via Keeper | [10](10-data-model.md) |
+| Storage policy | Ordered volumes a table may use; here `default` (local) then `cold` (S3) | [11](11-s3-tiering.md) |
+| TTL move | `TTL ... TO VOLUME 'cold'`: a part moves once its newest row passes the threshold | [11](11-s3-tiering.md) |
 
 ## Memory hooks
 
