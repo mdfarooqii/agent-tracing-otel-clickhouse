@@ -1,4 +1,4 @@
-# Module 0: Setup and the mental model (25 min)
+# Module 0: Setup and the mental model (30 min)
 
 ## Why this matters
 
@@ -42,6 +42,16 @@ together in order.
 In this repo, one request is one **agent turn**: a user asks a question, the
 agent runs a few LLM calls and tool calls, and some tools call HTTP APIs that
 run as separate processes. One turn becomes one trace.
+
+> **Quick check:** The support agent's turn touches two processes. Without
+> tracing, how many separate logs would you read to explain one slow answer?
+>
+> <details><summary>Answer</summary>
+>
+> At least two, with nothing to line them up but timestamps. With tracing, both
+> processes tag their notes with the same trace id, so one query returns the
+> whole turn.
+> </details>
 
 ### The cast: every component, and why it's there
 
@@ -97,44 +107,68 @@ Modules [7](07-clickhouse.md) to [11](11-s3-tiering.md) cover it.
 **ClickHouse Keeper**, `clickhouse-keeper` (Docker). Two copies of a table only
 stay identical if the servers agree on what has been written. Keeper keeps that
 shared to-do list: "clickhouse-01 wrote new data; clickhouse-02, please fetch
-it". Without Keeper, the replicated tables become read-only.
+it". Keeper holds only the list; the data itself is copied directly from one
+server to the other. Without Keeper, the replicated tables become read-only.
 
 **`clickhouse-init`** (Docker, runs once). Creates the `otel` database and its
 tables from `schema.sql`, waits until both replicas accept writes, then exits.
 The gateway only starts after it has finished.
 
-**Docker Compose.** `compose.yaml` describes the five containers above, their
-ports and their data volumes. `docker compose up -d` starts them all in the
-background.
-
 **`stack.sh`.** The one script you use. `./stack.sh up` makes sure Docker is
 running, creates a Python virtualenv (a private folder of packages, in
-`agent/.venv`) the first time, runs `docker compose up -d`, waits until the
+`agent/.venv`) the first time, runs `docker compose up -d` to start the five
+containers described in `compose.yaml`, waits until the
 gateway answers its health check, and starts the background traffic loop. The
 loop is `agent/simulate.py`: it starts the four APIs and runs every agent for
 3 turns, every 30 seconds.
 
-### Where each piece runs
+### The touch points map
 
-This matters when something breaks, and it explains the odd port numbers.
+Every place where two components talk is a **touch point**: a port, a
+protocol, and an agreement about what crosses it. When something breaks, it
+breaks at one of these, so later modules refer back to this map. The left
+column runs on your machine (the host); everything else runs in Docker.
 
 ```text
- Your machine (host)                          Docker network "agent-tracing-demo"
- ───────────────────                          ───────────────────────────────────
- agent processes ──OTLP──▶ localhost:14318 ──▶ otel-gateway:4318
- API processes   ──OTLP──▶ localhost:14318 ──▶ otel-gateway:4318
-                                               otel-gateway ──▶ clickhouse-01:9000 (or -02)
- your browser ───────────▶ localhost:8123  ──▶ clickhouse-01:8123  (Play UI, SQL)
- your browser ───────────▶ localhost:8124  ──▶ clickhouse-02:8123
-                                               clickhouse-01/02 ──▶ clickhouse-keeper:9181
- agent processes ──HTTP──▶ 127.0.0.1:18081-18084 (the APIs, also on the host)
+ HOST (Python)                     DOCKER network "agent-tracing-demo"
+ ─────────────                     ───────────────────────────────────
+ agent ──HTTP + traceparent──▶ API (127.0.0.1:18081-18084, also on the host)  [1]
+ agent, API ──OTLP/HTTP──▶ localhost:14318 ═▶ otel-gateway:4318               [2]
+                                   otel-gateway ──native TCP──▶ clickhouse-01:9000
+                                                   (failover)─▶ clickhouse-02:9000 [3]
+                                   clickhouse-01/02 ◀──▶ clickhouse-keeper:9181  [4]
+                                   clickhouse-01 ◀──parts, HTTP──▶ clickhouse-02:9009 [5]
+                                   clickhouse-01/02 ──▶ S3 bucket (module 11)  [6]
+ you ──HTTP──▶ localhost:8123 / 8124 ═▶ clickhouse-01 / -02:8123               [7]
+ you ──native──▶ localhost:9000 / 9001 ═▶ clickhouse-01 / -02:9000
+ (═▶ is a port mapping from a host port to a container port)
 ```
+
+| # | Touch point | What crosses it | Covered in |
+|---|---|---|---|
+| 1 | Agent to API, HTTP | The request, plus `traceparent` and `baggage` headers that carry the trace id | [1](01-otel-core.md), [6](06-cross-environment.md) |
+| 2 | App SDK to gateway, OTLP over HTTP, host `14318` to container `4318` (gRPC: `14317` to `4317`) | Batches of finished spans | [1](01-otel-core.md), [4](04-collector.md) |
+| 3 | Gateway to ClickHouse, native protocol on `9000` | Batched `INSERT`s into `otel.otel_traces`; the gateway tries `clickhouse-02` if `-01` is down | [4](04-collector.md), [12](12-operations.md) |
+| 4 | ClickHouse to Keeper, port `9181` | The replication to-do list and table metadata, not span data | [7](07-clickhouse.md) |
+| 5 | Replica to replica, port `9009` | Whole chunks of new data ("parts"), downloaded by the replica that's behind | [7](07-clickhouse.md), [10](10-copying-data.md) |
+| 6 | ClickHouse to S3 | Older data moved to cheap object storage | [11](11-s3-tiering.md) |
+| 7 | You to ClickHouse, HTTP `8123` (Play UI) or native `9000` (`clickhouse-client`) | Your SQL queries and their results | [7](07-clickhouse.md), [8](08-data-model.md) |
 
 OTLP (OpenTelemetry Protocol) is simply the format spans are sent in. The
 agents and APIs are on the host, so they reach the gateway through a **port
-mapping**: host port `14318` forwards to port `4318` inside the gateway
-container. The containers talk to each other by name (`clickhouse-01`,
-`clickhouse-keeper`) on their own Docker network.
+mapping**: host port `14318` forwards to port `4318` inside the container.
+The containers talk to each other by name (`clickhouse-01`,
+`clickhouse-keeper`) on their own Docker network; ports `9181` and `9009` are
+not mapped to the host at all.
+
+> **Quick check:** `clickhouse-02` is missing yesterday's spans, but its
+> connection to Keeper is fine. Which touch point would you suspect?
+>
+> <details><summary>Answer</summary>
+>
+> Number 5, port `9009`. Keeper only tells `clickhouse-02` what to fetch; the
+> data itself is downloaded from `clickhouse-01` over the interserver port.
+> </details>
 
 ### Follow one question from Python to a ClickHouse row
 
@@ -200,6 +234,15 @@ What to notice:
   travelled with the request from the agent (step 2), and `org_env` and
   `org_region` were added by the gateway (step 4).
 
+> **Quick check:** You run the query a second after a turn finishes and get
+> nothing new. Is something broken?
+>
+> <details><summary>Answer</summary>
+>
+> Probably not. The SDK waits up to 5 s to fill a batch, and the gateway waits
+> up to another 5 s, so a span can take about 10 s to arrive. Wait and retry.
+> </details>
+
 ## Remember it: the parcel route
 
 > **Make it, label it, ship it, sort it, shelve it.**
@@ -216,25 +259,7 @@ Spans take the same route:
 | Sort | The **gateway** filters, adds labels, batches, retries | `otel-gateway-config.yaml` |
 | Shelve | **ClickHouse** stores spans as rows; **Keeper** keeps the replicas in step | `clickhouse/schema.sql` |
 
-The same picture as a diagram. Arrows show which way data flows:
-
-```mermaid
-flowchart LR
-  subgraph agents [Agent processes]
-    A[support-agent<br/>hr-agent<br/>sales-agent]
-  end
-  subgraph apis [API processes]
-    B[kb-search-api<br/>ticket-api<br/>pricing-api<br/>legacy-hr-api]
-  end
-  A -- HTTP + trace id header --> B
-  A -- OTLP/HTTP --> G[otel-gateway<br/>Collector]
-  B -- OTLP/HTTP --> G
-  G -- native TCP --> C1[(clickhouse-01)]
-  G -. failover .-> C2[(clickhouse-02)]
-  C1 <-- replication via Keeper --> C2
-  K[clickhouse-keeper] --- C1
-  K --- C2
-```
+The arrows between those steps are the touch points in the map above.
 
 ## In this repo
 
@@ -252,6 +277,46 @@ flowchart LR
 | `compose.yaml` | The five containers, their ports and volumes |
 | `stack.sh` | The one-command control: `up`, `down`, `status`, `queries`, `logs`, `traffic`, `health` |
 | `queries.sql` | Saved example queries, run by `./stack.sh queries` |
+
+## Principal engineer's notes
+
+**Touch points**
+- The contract that matters most is touch point 2: OTLP plus the required
+  resource labels (`org.owner`, `org.service`). The platform team owns the
+  gateway; change the required labels and every service lacking them silently
+  loses its spans.
+- Touch point 3 is a schema contract: the gateway's ClickHouse exporter writes
+  columns that `schema.sql` must have, and `create_schema: false` means nobody
+  else creates them. Upgrade the Collector and the schema together.
+
+**At scale**
+- The same shape grows sideways: hundreds of services, each with an SDK, send
+  to a **fleet** of identical gateways behind a load balancer; the gateways
+  write to a ClickHouse **cluster** with several shards, each with two or three
+  replicas, and three or five Keeper nodes (an odd number, so a majority can
+  always agree).
+- Gateways are stateless, so you add more when CPU or memory is high.
+  ClickHouse usually strains first from too many small inserts, which is why
+  the gateway batches ([module 7](07-clickhouse.md)).
+
+**Operational issues**
+- The most common silent failure is spans that never arrive: dropped by the
+  gateway's label filter, or by a full queue in the SDK. Neither shows up as
+  an error in the application. Watch the gateway's refused and dropped counts
+  ([module 12](12-operations.md)).
+- If Keeper is unhealthy, inserts fail even though both ClickHouse servers
+  are "up". Check Keeper before blaming the database.
+
+**Design trade-offs**
+- **Never couple app latency to the backend's health.** The SDK exports from a
+  background thread, and the gateway absorbs retries, so a slow ClickHouse
+  never slows a user's answer. The price: when the backend is down long
+  enough, spans are lost rather than the app waiting. That is almost always
+  the right trade; telemetry is not a ledger.
+- Apps send straight to a central gateway here. Large setups often add a
+  small Collector next to each app, so the app hands off spans on localhost and
+  the network hop becomes the Collector's problem. Choose that when the network
+  to the gateway is slow or unreliable.
 
 ## Lab (10 min)
 
@@ -328,8 +393,7 @@ flowchart LR
      of the same HTTP call.
    - The server span is slightly shorter than the client span (178 ms inside
      180 ms). The gap is network and HTTP overhead.
-   - `agent_turn` lasts as long as everything inside it, because every other
-     span is nested inside it.
+   - `agent_turn` lasts as long as everything nested inside it.
 
 3. **See one row in full.** Run the `FORMAT Vertical` query from "Follow one
    question" above and match each column to the step that produced it. In the
@@ -357,10 +421,11 @@ flowchart LR
 - The agents and APIs are Python processes on your machine. The gateway,
   ClickHouse, Keeper and the init job run in Docker.
 - Spans are made by the SDK, sent over OTLP to the gateway on port `14318`,
-  checked and labelled there, and inserted into `otel.otel_traces`.
-- A trace crosses from the agent to an API because the trace id travels in an
-  HTTP header.
-- Two ClickHouse replicas hold the same data; Keeper keeps them in agreement.
+  checked and labelled there, and inserted into `otel.otel_traces`. A trace
+  crosses into an API because the trace id travels in an HTTP header.
+- Two ClickHouse replicas hold the same data; Keeper keeps the to-do list, and
+  the replicas copy data to each other directly.
+- The touch points map lists every interface; problems happen at one of them.
 - `./stack.sh status`, `queries`, `logs` and `traffic on|off` are your main
   controls.
 
@@ -383,13 +448,6 @@ ClickHouse never create the application's spans; they filter, label, buffer
 and store them.
 </details>
 
-<details><summary>The agents send to <code>localhost:14318</code>, but the gateway config listens on <code>4318</code>. Why do both work?</summary>
-
-The agents run on the host; the gateway runs in a container. `compose.yaml`
-maps host port `14318` to container port `4318`, so traffic to
-`localhost:14318` arrives at the gateway's `4318`.
-</details>
-
 <details><summary>You stop <code>clickhouse-01</code>. Can you still see yesterday's spans?</summary>
 
 Yes. `clickhouse-02` is a full replica with the same rows; query it at
@@ -397,11 +455,11 @@ Yes. `clickhouse-02` is a full replica with the same rows; query it at
 `clickhouse-02`, because both servers are listed in its exporter endpoint.
 </details>
 
-<details><summary>What does Keeper do, in one sentence?</summary>
+<details><summary>ClickHouse is down for a minute. Does the support agent answer more slowly?</summary>
 
-It keeps the shared record of what data each replicated table should contain,
-so that each ClickHouse replica knows which new data it still needs to fetch
-from the other.
+No. The SDK sends spans from a background thread to the gateway, and the
+gateway retries the inserts. Users don't wait; at worst, spans arrive late or,
+after a long outage, are lost.
 </details>
 
 ## Next

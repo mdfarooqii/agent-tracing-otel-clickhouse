@@ -1,4 +1,4 @@
-# Module 1: OpenTelemetry core (50 min)
+# Module 1: OpenTelemetry core (55 min)
 
 ## Why this matters
 
@@ -144,6 +144,16 @@ draws an edge between two services: query 7 in `queries.sql` joins every
 server span to the client span that is its parent, and reports "which service
 calls which".
 
+> **Quick check:** `pricing-api` names its server span `GET /v1/prices/SKU-200`.
+> What goes wrong when you group spans by name?
+>
+> <details><summary>Answer</summary>
+>
+> Every SKU becomes its own span name, so "all price lookups" splits into
+> thousands of groups. Use the route template `GET /v1/prices/{sku}` and put
+> the SKU in an attribute.
+> </details>
+
 ### Context: the current span inside one process
 
 **Why.** When `call_api` starts its client span, how does it know its parent
@@ -172,7 +182,25 @@ span was current, so it became a root span and got a brand-new random trace
 id. The same thing happens in `run.py`: `agent_turn` starts with nothing
 current, so it is the root of the turn's trace.
 
+The badge is stored per thread and per async task (Python's `contextvars`).
+Work handed to a new thread or a thread pool starts *without* the badge unless
+you pass the context along yourself; [module 2](02-langgraph.md) shows a case
+where this repo sets the current span by hand with `context.attach`.
+
+> **Quick check:** Code submits a function to a `ThreadPoolExecutor`, and the
+> function starts a span. What is that span's parent?
+>
+> <details><summary>Answer</summary>
+>
+> Usually none: the worker thread has its own empty context, so the span
+> becomes a root with a new trace id. Capture `context.get_current()` before
+> submitting and `context.attach(...)` it inside the worker.
+> </details>
+
 ### Propagation: carrying context across the network
+
+Remember from [module 0](00-setup.md#the-touch-points-map): this is touch
+point 1, the agent's HTTP call to an API.
 
 **Why.** Context lives in memory, inside one process. `kb-search-api` is a
 different process; it can't see the agent's memory. Without help, its server
@@ -253,6 +281,16 @@ Nothing about this is AI-specific: any HTTP service, database client or batch
 job joins a trace the same way. [Module 6](06-cross-environment.md) covers
 what has to hold for that to work across services and environments.
 
+> **Quick check:** `kb-search-api` forgets to call `propagate.extract`. What
+> does the trace look like?
+>
+> <details><summary>Answer</summary>
+>
+> The agent's `GET /v1/search` client span has no child. The API's server span
+> becomes a root with a new trace id: a separate one-span trace.
+> `STRIP_TRACE_HEADERS=1` makes `apis.py` do exactly this, if you want to see it.
+> </details>
+
 ### Lab 1 (5 min): spans, context and headers
 
 Run the lab script. It sets up OpenTelemetry with an exporter that prints
@@ -285,9 +323,7 @@ Headers a client would send: {'traceparent': '00-979bfbd9d471a3865291b978e75b8e3
     "resource": {
         "attributes": {
             "telemetry.sdk.language": "python",
-            "telemetry.sdk.name": "opentelemetry",
-            "telemetry.sdk.version": "...",
-            "service.instance.id": "...",
+            ...
             "service.name": "hello",
             "org.owner": "me"
         },
@@ -419,6 +455,16 @@ spans (through `span_attributes` in `apis.py`) and leaves its resource empty,
 so every one of its spans is dropped. Same keys, wrong place.
 [Module 4](04-collector.md) shows the filter that does it.
 
+> **Quick check:** You want every `ticket-api` span to show the tenant. Is
+> adding `org.tenant` to `ticket-api`'s resource the right fix?
+>
+> <details><summary>Answer</summary>
+>
+> No. The resource is fixed for the whole process, but the tenant changes per
+> request. Add `org.tenant` to `ticket-api`'s `span_labels` so it copies the
+> value from baggage onto each server span.
+> </details>
+
 A quick way to decide where a fact goes:
 
 | Question | Put it on | Example |
@@ -502,20 +548,33 @@ this repo every span, from agents and APIs alike, has scope `agent-tracing`.
 
 **The batch span processor.** `BatchSpanProcessor` keeps finished spans in an
 in-memory queue and exports them in batches from a background thread, so your
-code never waits for the network. Defaults: queue 2048 spans, batch 512,
-every 5 s. Two consequences:
+code never waits for the network. Defaults in the installed SDK (1.45): queue
+2048 spans, batch 512, every 5 s, export timeout 30 s. Two consequences:
 
-- **If the queue is full, new spans are dropped.** The queue is in memory; it
-  is not a durable buffer.
+- **If the queue is full, spans are dropped.** In this SDK version the
+  *oldest* queued span is pushed out to make room, and a `Queue full,
+  dropping` warning is logged. The queue is in memory; it is not a durable
+  buffer.
 - Spans still in the queue when the process exits are lost, unless you call
   `provider.shutdown()`, which flushes whatever is left. That's why `run.py`
   and `apis.py` both call it before exiting.
+
+> **Quick check:** A burst creates 5,000 spans in one second while the gateway
+> is slow. Does the agent's answer get slower?
+>
+> <details><summary>Answer</summary>
+>
+> No. Ending a span only puts it in the queue. Past 2048 queued spans, the
+> oldest are dropped instead; the cost is lost telemetry, not user latency.
+> </details>
 
 The lab script uses the simpler `SimpleSpanProcessor` instead, which exports
 each span immediately when it ends. That's handy for printing, but too slow
 for real services because the code waits for every export.
 
-**The exporter and OTLP.** The exporter turns spans into bytes and sends them.
+**The exporter and OTLP.** Remember from
+[module 0](00-setup.md#the-touch-points-map): this is touch point 2. The
+exporter turns spans into bytes and sends them.
 This repo uses `OTLPSpanExporter` from the
 `opentelemetry.exporter.otlp.proto.http` package. **OTLP** is the
 OpenTelemetry Protocol: spans encoded with protobuf (a compact binary format)
@@ -580,6 +639,53 @@ the out-tray, exporter = the courier, OTLP = the shape of the parcel.**
   `sales-agent` has no tenants, so its requests carry no `org.tenant`.
 - `docs/tutorial/labs/hello_span.py`: the smallest possible example: two
   nested spans, baggage, and the headers `inject` writes.
+
+## Principal engineer's notes
+
+**Touch points**
+- Between services, the contract is the W3C `traceparent` and `baggage`
+  headers. Every hop (proxy, gateway, queue, legacy service) must pass them
+  through untouched; one hop that drops them splits the trace in two.
+- To the gateway, the contract is OTLP plus the required resource labels. Pin
+  the endpoint and protocol with `OTEL_EXPORTER_OTLP_*` variables, not code.
+
+**At scale**
+- A span costs microseconds of CPU and some hundreds of bytes on the wire, but
+  a span in a tight loop can cost more than the work. Instrument operations
+  that matter, not every function.
+- The batch queue (2048) drains at most 512 spans per export. A process that
+  makes thousands of spans per second and a gateway that answers slowly will
+  fill it; raise `OTEL_BSP_MAX_QUEUE_SIZE` and `OTEL_BSP_MAX_EXPORT_BATCH_SIZE`,
+  or sample ([module 5](05-sampling.md)).
+- Attribute **cardinality** (how many distinct values a key has) is cheap in
+  the SDK but expensive downstream. User ids and SKUs belong in attributes,
+  never in span names or resource labels. The SDK caps a span at 128
+  attributes and 128 events by default and silently drops the rest.
+
+**Operational issues**
+- **Silent drops.** A full queue only logs `Queue full, dropping`, and only if
+  Python logging is configured. Compare what apps send with what the gateway
+  receives ([module 12](12-operations.md)).
+- **Context loss.** Thread pools, some async patterns and other libraries'
+  callbacks start with an empty context. The symptom: unexpected root spans,
+  or traces that stop at one service.
+- **Short-lived processes.** CLI jobs and serverless functions can exit before
+  the 5 s export. Call `provider.shutdown()`, or `force_flush()` at the end of
+  each serverless call, since the runtime may freeze the process without
+  shutting it down.
+- **Baggage risks.** Baggage goes in a header on every outgoing call, including
+  calls to third parties outside your trust boundary. Never put personal data
+  or secrets in it, keep it small (the W3C limit is 8192 bytes), and don't
+  trust incoming baggage: anyone can send any value.
+
+**Design trade-offs**
+- **API vs SDK versions.** Libraries depend only on `opentelemetry-api`, which
+  stays backward compatible; the application pins the SDK and exporter to
+  matching versions (here 1.45.2). Mismatched versions are a common cause of
+  "no spans" after an upgrade.
+- This repo instruments by hand. Auto-instrumentation covers common libraries
+  with no code changes; choose it for breadth, and hand instrumentation where
+  you need precise names and attributes, as for agents.
 
 ## Lab 2 (10 min): resource, and spans in ClickHouse
 
@@ -694,20 +800,12 @@ directory.
 
 ## Check yourself
 
-<details><summary>A span's name is <code>GET /v1/prices/sku-123</code>. What's wrong?</summary>
-
-The name contains an id, so every SKU becomes a different span name, which
-breaks grouping and indexing. Use the route template
-(`GET /v1/prices/{sku}`) and put the SKU in an attribute if needed. This repo
-does that through `url.template` on the client span (and `http.route` on the
-server span).
-</details>
-
 <details><summary>What happens to spans if the collector is down for 10 minutes?</summary>
 
-The exporter fails and retries; meanwhile the `BatchSpanProcessor` queue fills
-up (2048 spans by default) and then **drops new spans**. The SDK is not a
-durable buffer. That's one reason to run a Collector close to the app.
+Each export fails after retrying for up to its timeout; meanwhile the
+`BatchSpanProcessor` queue fills up (2048 spans by default) and then **drops
+spans**, oldest first, logging `Queue full, dropping`. The SDK is not a durable
+buffer. That's one reason to run a Collector close to the app.
 </details>
 
 <details><summary>Why doesn't baggage show up as span attributes by itself?</summary>
@@ -735,20 +833,11 @@ using the default parent-based sampler will record it too
 Context level 2): the trace id was generated randomly.
 </details>
 
-<details><summary><code>kb-search-api</code> forgets to call <code>propagate.extract</code>. What does the trace look like?</summary>
+<details><summary>Module 0 says spans take up to about 10 seconds to reach ClickHouse. Which part of this module explains the first half of that wait?</summary>
 
-The agent's trace still has its `GET /v1/search` client span, but it has no
-child. The API's server span starts with no current span, so it becomes a
-root span with a new trace id: a separate, one-span trace. The query in Lab 2
-step 2 would find no pair for it. You can see this effect with
-`STRIP_TRACE_HEADERS=1`, which makes `apis.py` extract from empty headers.
-</details>
-
-<details><summary><code>legacy-hr-api</code> sends <code>org.owner</code> and <code>org.service</code>. Why are its spans dropped anyway?</summary>
-
-It sends them as span attributes, not as resource attributes. The gateway's
-filter checks only the resource, so to the gateway these spans have no owner
-or service, and it drops them.
+The `BatchSpanProcessor`: it exports every 5 s (or sooner when 512 spans are
+waiting). The gateway's own batch timeout of 5 s is the second half
+([module 4](04-collector.md)).
 </details>
 
 <details><summary>Why does <code>run.py</code> call <code>provider.shutdown()</code> at the end?</summary>
@@ -758,13 +847,6 @@ The batch processor sends spans every 5 seconds from a background thread. When
 the queue. `shutdown()` flushes them to the exporter before the process exits;
 without it, the last turn would often be missing.
 </details>
-
-<details><summary>A library you use is instrumented with OpenTelemetry, but you never call <code>setup_tracing</code>. Do you get spans?</summary>
-
-No. The library calls the API, and with no SDK tracer provider registered,
-those calls are no-ops. Nothing is recorded or sent.
-</details>
-
 ## Next
 
 You now know how one span finds its parent. But who creates the

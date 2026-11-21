@@ -1,4 +1,4 @@
-# Module 2: LangChain, LangGraph and callbacks (50 min)
+# Module 2: LangChain, LangGraph and callbacks (55 min)
 
 ## Why this matters
 
@@ -72,13 +72,10 @@ knowledge-base API, and `count_words` counts words in a draft.
 
 **Agent.** An agent is code that combines the two: it asks an LLM what to do,
 then does it, often by calling a tool, and repeats until it has an answer.
-Think of a new support hire: they read the question, look things up, then
-write a reply.
 
-> In this demo the decisions are plain Python (for example "no notes yet, so go
-> to the researcher") and the LLM call is made alongside, so the traces look
-> realistic. In a real agent, the model's reply would drive the decision. The
-> tracing works the same either way.
+> In this demo the decisions are plain Python ("no notes yet, so go to the
+> researcher"), with an LLM call alongside; in a real agent the model's reply
+> drives the decision. The tracing is the same either way.
 
 **Graph, node, edge, state.** When one agent isn't enough, you split the work
 into steps and draw arrows between them. That drawing is a **graph**. Each
@@ -113,9 +110,18 @@ flowchart LR
 
 For our request, the path is: supervisor, researcher, supervisor, writer,
 supervisor, end. The supervisor runs three times; each worker runs once.
-LangGraph has a few more moving parts (how state is merged, how it's saved
-between turns); they're easier to follow once you've seen the spans, so
-they come [after the span tree](#under-the-hood-steps-and-the-checkpointer).
+How state is merged and saved between turns comes
+[after the span tree](#under-the-hood-steps-and-the-checkpointer).
+
+> **Quick check:** You add a `reviewer` worker between `writer` and
+> `supervisor` (writer -> reviewer -> supervisor). How many node runs does
+> turn 1 now have?
+>
+> <details><summary>Answer</summary>
+>
+> Six: the supervisor still decides three times (researcher, writer, FINISH),
+> plus researcher, writer and reviewer once each.
+> </details>
 
 ### LangChain: everything is a Runnable
 
@@ -218,21 +224,14 @@ else:                                  # plumbing
     self._alias(run_id, parent_run_id)
 ```
 
-Putting it together for our request:
-
-```text
-callback event (run id, parent)          span written
--------------------------------          -------------------------------------
-on_chain_start      support_supervisor   invoke_workflow support_supervisor
-  on_chain_start    supervisor           invoke_agent supervisor
-    on_chat_model_start fake-supervisor    chat fake-supervisor
-    on_chain_start  RunnableCallable       (none: routing plumbing)
-  on_chain_start    researcher           invoke_agent researcher
-    on_tool_start   search_knowledge_base  execute_tool search_knowledge_base
-    on_chat_model_start fake-researcher    chat fake-researcher
-  on_chain_start    supervisor           invoke_agent supervisor
-  ...
-```
+> **Quick check:** Why not simply create a span for every `on_chain_start`?
+>
+> <details><summary>Answer</summary>
+>
+> LangGraph also reports plumbing runs, such as the routing function. Spans
+> for those add noise and storage cost and say nothing about the agent. The
+> tracer skips them but keeps their children attached to the nearest real span.
+> </details>
 
 ### Lab 1 (5 min): see the raw callbacks
 
@@ -269,12 +268,9 @@ on_chain_start        #16 parent= #14  node=supervisor  RunnableCallable
 How to read it: `#N` is a short number for each `run_id`, and `parent=` is
 the short number of its `parent_run_id`.
 
-- `#1` has no parent, so it becomes `invoke_workflow support_supervisor`.
-- `#2`, `#5`, `#8`, `#11`, `#14` have a name equal to their node, so each
-  becomes an `invoke_agent` span.
-- `#4`, `#10`, `#16` are the routing function (`RunnableCallable`):
-  plumbing, no span.
-- The supervisor appears three times, once per decision.
+- `#1` has no parent: `invoke_workflow support_supervisor`.
+- `#2`, `#5`, `#8`, `#11`, `#14` have a name equal to their node:
+  `invoke_agent` spans. `#4`, `#10`, `#16` are routing plumbing: no span.
 - There's no line for the HTTP request: that's not a LangChain Runnable.
   It's the `call_api` span, which the tracer places under the tool span
   (see [below](#the-tricky-part-tools-that-make-http-calls)).
@@ -314,14 +310,16 @@ We want that HTTP request, and the API's own span on the other side, to appear
 *under* `execute_tool search_knowledge_base`. Otherwise you can't tell which
 tool made which call.
 
+> Remember from [module 1](01-otel-core.md): the context is the "current
+> span" badge; a new span started with `start_as_current_span` takes whoever
+> wears the badge as its parent.
+
 **Why it doesn't happen by itself.** The tracer creates spans with
-`start_span(...)`, which records a span but does *not* make it the "current
-span" in the context. That's fine for chat spans, because nothing inside the
-fake model starts spans of its own. But the HTTP helper `call_api` in
-`agent/telemetry.py` starts its client span with `start_as_current_span(...)`,
-which picks its parent from the current context. If the tool span isn't
-current, the HTTP span's parent would be whatever span *is* current: the
-`agent_turn` span from the previous section.
+`start_span(...)`, which does *not* hand over the badge. That's fine for chat
+spans, because nothing inside the fake model starts spans. But `call_api` in
+`agent/telemetry.py` starts its HTTP span with `start_as_current_span(...)`.
+If the tool span isn't current, the HTTP span's parent is whatever *is*
+current: the `agent_turn` span from the previous section.
 
 **The fix.** In `on_tool_start`, the tracer makes the tool span current with
 `context.attach(...)`, and undoes it with `context.detach(...)` in
@@ -339,6 +337,16 @@ execute_tool search_knowledge_base          (made current by context.attach)
 └── GET /v1/search        support-agent     client span, writes traceparent
     └── GET /v1/search    kb-search-api     server span, reads traceparent
 ```
+
+> **Quick check:** What would the trace look like without `context.attach`
+> in `on_tool_start`?
+>
+> <details><summary>Answer</summary>
+>
+> Both `GET /v1/search` spans would hang under `agent_turn` instead of
+> `execute_tool search_knowledge_base`. Still one connected trace, but you
+> couldn't tell which tool made which call.
+> </details>
 
 ### The full span tree
 
@@ -403,6 +411,16 @@ Now that you've seen the spans, here are the LangGraph details behind them.
   `{**spec.turn_state, ...}`. `messages` is not reset, so the conversation
   history persists.
 
+> **Quick check:** A graph starts two workers at the same time. Do their two
+> `invoke_agent` spans get different `org.agent.step` values?
+>
+> <details><summary>Answer</summary>
+>
+> No. Both are ready in the same superstep, so they run in parallel and share
+> one step number. The support graph only ever has one ready node, which is
+> why its steps and agent spans line up one to one.
+> </details>
+
 ## Remember it
 
 > **LangChain shouts "I started, I finished" with a run id and a parent id.
@@ -431,10 +449,58 @@ head waiter, checkpointer = saving the whiteboard between turns.**
 - `agent/run.py`: the `agent_turn` span, baggage, and `graph.invoke(...)` with
   the tracer as a callback.
 
+## Principal engineer's notes
+
+**Touch points**
+
+- *LangChain callback API.* Method signatures and the metadata keys
+  `langgraph_node`, `langgraph_step`, `ls_model_name`, `ls_provider` are a
+  contract LangChain owns. Rename one and nothing crashes: agent spans vanish
+  or models read `unknown`. That's why `requirements.txt` pins exact versions.
+- *Tracer to `call_api`.* HTTP spans nest only while `on_tool_start` makes
+  the tool span current. *`run.py`* creates one tracer per turn, so its
+  `run_id -> span` dictionary can't grow across turns.
+
+**At scale**
+
+- Spans per turn grow with steps x (1 + LLM calls + tools + HTTP calls):
+  16 for turn 1 here, easily 150 for a 30-step graph. Long conversations
+  don't lengthen traces (one per turn) but do grow prompts
+  ([module 3](03-genai-semconv.md)).
+- Knobs, cheapest first: skip more plumbing, record trivial tools as span
+  events, then sample ([module 5](05-sampling.md)).
+- Streaming fires `on_llm_new_token` per token. Never span per token; record
+  time to first token once on the `chat` span (this tracer doesn't).
+
+**Operational issues**
+
+- *Handlers run inline.* In a sync `graph.invoke` each callback runs on the
+  agent's thread, so a slow handler slows every step. Keep handlers to
+  lookups and `start_span`; the `BatchSpanProcessor` exports later.
+- *Handler exceptions are swallowed.* LangChain logs `Error in
+  LangGraphTracer.on_... callback` and carries on (`raise_error` defaults to
+  `False`). The agent survives; the spans don't. Alert on that log line.
+- *Async graphs.* Under `graph.ainvoke`, a sync handler runs in a thread pool
+  inside a *copy* of the context, so `context.attach` never reaches the tool
+  and HTTP spans fall back to `agent_turn`. Use an async handler (or
+  `run_inline = True`) and test it.
+- *Thread pools.* Parenting by `run_id` works on any thread (hence the
+  tracer's lock); context-based parenting doesn't. A tool with its own
+  `ThreadPoolExecutor` must submit via `contextvars.copy_context().run`.
+- *Upgrades* change callback shapes. Keep a golden-trace test that runs one
+  turn and asserts the span tree.
+
+**Design trade-offs**
+
+- *Callbacks (this repo)*: full control of names and what counts, but you
+  maintain code that tracks the framework. *A ready-made LangChain
+  instrumentation package*: less code, but its names, choices and release
+  cadence; pick it for many repos and no tracer owner. *Manual spans*:
+  explicit but easy to forget; use them for business steps callbacks can't see.
+
 ## Lab 2 (10 min)
 
-Lab 1 is [above](#lab-1-5-min-see-the-raw-callbacks), after "How callbacks
-become spans". Run SQL with
+Run SQL with
 `docker exec clickhouse-01 clickhouse-client --password demo -q "..."` or in
 <http://localhost:8123/play> (user `default`, password `demo`).
 
@@ -515,17 +581,13 @@ become spans". Run SQL with
 
 ## Explain it back
 
-> "An agent uses an LLM to decide what to do and tools to do it. LangGraph
-> wires several agents into a graph: nodes are functions, edges pick the next
-> node, a supervisor node routes work to worker nodes, and a checkpointer
-> keeps state per conversation thread. Every node, model and tool call is a
-> LangChain Runnable, and Runnables report start and end events to callbacks
-> with a run id and a parent run id. Our callback handler maps those events to
-> OpenTelemetry spans under the `agent_turn` root: the graph becomes
-> `invoke_workflow`, agent nodes become `invoke_agent`, model calls become
-> `chat`, tools become `execute_tool`, and plumbing gets no span. The tool
-> span is made current so the HTTP calls it makes, and the APIs behind them,
-> join the same trace under it."
+> "LangGraph wires agents into a graph: nodes are functions, edges pick the
+> next node, a supervisor routes work to workers, and a checkpointer keeps
+> state per conversation. Every node, model and tool is a Runnable that reports
+> start and end to callbacks with a run id and parent run id. Our handler maps
+> those to spans under `agent_turn`: `invoke_workflow`, `invoke_agent`, `chat`,
+> `execute_tool`, and nothing for plumbing. The tool span is made current so
+> its HTTP calls, and the APIs behind them, nest under it."
 
 ## Recap
 
@@ -563,14 +625,6 @@ answer), then "FINISH" (an answer exists). The edges `researcher -> supervisor`
 and `writer -> supervisor` bring control back after each worker.
 </details>
 
-<details><summary>Why not create a span for every <code>on_chain_start</code>?</summary>
-
-LangGraph emits chain runs for internal plumbing, such as the routing
-function. Spans for those add noise and storage cost without telling you
-anything about the agent. The tracer skips them but keeps their children
-attached to the nearest real span.
-</details>
-
 <details><summary>Why does the tracer need <code>parent_run_id</code> at all?</summary>
 
 Without it, the tracer couldn't tell which span a new span belongs under. Every
@@ -587,21 +641,21 @@ in the same way. You'd see real values in `gen_ai.provider.name` (the fake
 model reports `fakechatmodel`) and real token counts instead of word counts.
 </details>
 
-<details><summary>What would the trace look like without <code>context.attach</code> in <code>on_tool_start</code>?</summary>
+<details><summary>Mixing with module 1: the tracer links chat spans by <code>run_id</code>, but the kb-search-api span is in another process. What links that one?</summary>
 
-The `GET /v1/search` client span, and the API's server span, would become
-children of `agent_turn` (the context's current span) instead of
-`execute_tool search_knowledge_base`. The trace would still be connected, but
-you couldn't tell which tool made which call.
+Propagation, not callbacks. `call_api` writes the `traceparent` header
+(trace id plus the client span's id), and kb-search-api starts its server
+span from it. Callbacks can only build the tree inside one process; headers
+carry it across the network.
 </details>
 
-<details><summary>Turn 1 has agent spans at steps 1 to 5. Would a graph with two workers running side by side still have one step per agent span?</summary>
+<details><summary>Your tracing handler has a bug and raises in <code>on_tool_start</code>. What does the user see, and what do you see?</summary>
 
-No. A LangGraph step (superstep) runs every node that is ready at that
-moment, in parallel. Two workers started together would run in the same
-step, so their two `invoke_agent` spans would share one step number. The
-support graph only ever has one ready node, which is why its step numbers
-and agent spans line up one to one.
+The user sees a normal answer: LangChain logs the handler error as a warning
+and continues, because `raise_error` defaults to `False`. You see a trace
+with a missing or misplaced tool span (its HTTP spans fall back under
+`agent_turn`), plus an
+`Error in LangGraphTracer.on_tool_start callback` warning in the agent's logs.
 </details>
 
 <details><summary>Why does <code>run.py</code> reset <code>notes</code> and <code>answer</code> at the start of each turn?</summary>

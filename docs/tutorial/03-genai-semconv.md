@@ -1,4 +1,4 @@
-# Module 3: GenAI semantic conventions (50 min)
+# Module 3: GenAI semantic conventions (55 min)
 
 ## Why this matters
 
@@ -88,10 +88,6 @@ works for every team, every library, and every backend that understands
 OpenTelemetry. "Semantic" just means "about meaning": the conventions fix
 what each name *means*, so that a name means the same thing everywhere.
 
-Think of it like the labels on a shipping box. Any courier in the world knows
-where to look for the destination and the weight, because the label layout is
-standard. The contents differ; the label layout doesn't.
-
 You've already met another set of conventions in this repo: the HTTP ones.
 `call_api` in `agent/telemetry.py` uses `http.request.method`,
 `http.response.status_code` and `url.full`. Those come from the HTTP
@@ -109,10 +105,8 @@ conventions, exactly as the `gen_ai.*` names come from the GenAI conventions.
    SCHEMA_URL = Schemas.V1_44_0.value
    ```
 
-   `SCHEMA_URL` is passed both to the resource (`Resource.create(...,
-   schema_url=SCHEMA_URL)`) and to the tracer (`get_tracer(...,
-   schema_url=SCHEMA_URL)`), so every span this repo writes is stamped
-   "I follow version 1.44.0".
+   It's passed to both `Resource.create(...)` and `get_tracer(...)`, so
+   every span is stamped "I follow version 1.44.0".
 
 2. **They have stability levels.** The HTTP conventions are *stable*: the
    names won't change. **The GenAI conventions are still in *development***:
@@ -131,13 +125,23 @@ conventions, exactly as the `gen_ai.*` names come from the GenAI conventions.
    [module 1](01-otel-core.md#resource-who-produced-the-spans)). No official
    name will ever start with `org.`, so they can't collide.
 
+> **Quick check:** You want a "customer tier" label on every agent span. Why
+> not call it `gen_ai.customer.tier`?
+>
+> <details><summary>Answer</summary>
+>
+> The `gen_ai.` prefix belongs to the conventions; a future release could
+> define that name with a different meaning. Use your own namespace:
+> `org.customer.tier`.
+> </details>
+
 ### The four operations this repo uses
 
 The single most important GenAI attribute is **`gen_ai.operation.name`**. It
 says what kind of GenAI work a span records. It drives the span name, the
 span kind, and which other attributes belong on the span.
 
-Think of it as the "type of parcel" box on the shipping label. Once you know
+Think of it as the "type of parcel" box on a shipping label: once you know
 the parcel type, you know which other fields to look for.
 
 The four operations this repo writes, from the outside in:
@@ -163,7 +167,21 @@ nine: `chat`, `generate_content`, `text_completion`, `embeddings`,
 `retrieval`, `create_agent`, `invoke_agent`, `execute_tool`,
 `invoke_workflow`.
 
+> **Quick check:** The researcher's tool makes an HTTP call. Which of the
+> spans under `invoke_agent researcher` are `CLIENT` spans?
+>
+> <details><summary>Answer</summary>
+>
+> `chat fake-researcher` (a model call normally leaves the process) and the
+> client-side `GET /v1/search`. The `execute_tool` span itself is `INTERNAL`:
+> it records the tool function running inside the agent.
+> </details>
+
 ### Which span gets which attribute
+
+> Remember from [module 2](02-langgraph.md#what-a-callback-is): each GenAI
+> span is opened by one callback (`on_chain_start`, `on_chat_model_start`,
+> `on_tool_start`), so the attributes are whatever that callback can see.
 
 Here is every `gen_ai.*` attribute this repo writes, and which spans carry it.
 It's taken straight from `LangGraphTracer` in `agent/telemetry.py`, and checked
@@ -344,6 +362,15 @@ For our request, summing the five chat spans gives 87 input tokens (37 of
 them cached) and 40 output tokens. That sum is a query, not an attribute (lab
 step 3).
 
+> **Quick check:** A provider reports "200 input, 800 cached" as two separate
+> numbers. What do you record?
+>
+> <details><summary>Answer</summary>
+>
+> `input_tokens = 1000` and `cache_read.input_tokens = 800`. The input is
+> the full prompt; the cache figure is a breakdown of it, priced differently.
+> </details>
+
 In this repo the fake model reports **word counts as token counts** (see
 `FakeChatModel` in `agent/graph.py`). The numbers are realistic in shape but
 not in size. With a real model, the same attributes would carry real counts,
@@ -387,6 +414,16 @@ Instead, every turn is its own short trace, and every turn carries the same
 with this conversation id, in time order" (lab step 4). Think of a support
 ticket with several emails: each email is handled on its own, and the ticket
 number ties them together.
+
+> **Quick check:** A user comes back four days later and continues the same
+> conversation. Will the session query show all their turns?
+>
+> <details><summary>Answer</summary>
+>
+> No. The id still ties the turns together, but `otel.otel_traces` keeps
+> spans for 72 hours (its TTL), so the older turns are gone. Long-lived
+> session history needs its own, longer-lived table.
+> </details>
 
 **Evals (evaluations).** Everything so far measures *performance*: how long,
 how many tokens, did it fail. Evals measure *quality*: was the answer
@@ -470,6 +507,52 @@ pin the schema version.
 - `queries.sql`: queries 2, 3, 4 and 5 group and filter by
   `gen_ai.operation.name` and `gen_ai.agent.name`, for example per-agent
   latency and the agent hand-off path per turn.
+
+## Principal engineer's notes
+
+**Touch points**
+
+- An attribute name is a contract with three owners: the tracer, the
+  `MATERIALIZED` column in `schema.sql`, and every saved query. Rename it in
+  the tracer and nothing errors; new rows just read `''` or `0`.
+- The schema URL travels in OTLP, but `otel.otel_traces` has no column for
+  it: stored rows don't say which version they followed.
+
+**At scale**
+
+- Content dwarfs everything. A span's attributes are a few hundred bytes; a
+  prompt with history is kilobytes and grows every turn. If you capture it,
+  send it as log events to a separate table with its own short TTL and access
+  rules, keyed by `TraceId` and `SpanId`.
+- High-cardinality ids (conversation, turn, user) belong in attributes or
+  plain `String` columns with a bloom filter (`idx_conv_id`), never in
+  `LowCardinality` columns or metric labels (`span_red_1m` has none).
+- Evals run as an asynchronous, sampled job (some successes, every error),
+  keyed by trace id. Evaluate traces you kept: after tail sampling
+  ([module 5](05-sampling.md)) a score can point at a deleted trace.
+
+**Operational issues**
+
+- *Names change.* Instrumentation libraries read `OTEL_SEMCONV_STABILITY_OPT_IN`
+  to emit old names, new names, or both during a migration. Do the same: pin
+  the package and schema URL, emit both for a release, query either
+  (`if(new != '', new, old)`). A changed `MATERIALIZED` expression only
+  affects new inserts; `ALTER TABLE ... MATERIALIZE COLUMN` recomputes old parts.
+- *Cost per tenant or agent* is a `GROUP BY` over `chat` spans. Watch the
+  empty bucket: `sales-agent` has no tenants, so its tokens land under `''`.
+  Keep prices in a table keyed by model and date; join at query time.
+- *Double counting.* A second instrumentation layer beside these callbacks
+  (say, a provider SDK's) means two chat spans per call. Retries are real,
+  separately billed calls: count each.
+- *Sampling skews totals.* For billing-grade numbers, count before sampling
+  (`gen_ai.client.token.usage` metrics) or weight by the sample rate.
+
+**Design trade-offs**
+
+- No content, ever (this repo) vs opt-in capture to a separate store: choose
+  the latter to debug prompts or run text-based evals, after PII review.
+- `org.agent.workflow` over `gen_ai.workflow.name`: safe now, one more name
+  to migrate later.
 
 ## Lab (15 min)
 
@@ -590,14 +673,12 @@ spans from all three agent services.
 
 ## Explain it back
 
-> "The GenAI semantic conventions are OpenTelemetry's shared names for AI
-> workloads. `gen_ai.operation.name` says what a span is: a workflow, an agent
-> invocation, a chat call or a tool execution, and that sets the span name.
-> Chat spans carry the provider, the model and the token usage, including
-> cached and reasoning tokens; agent spans carry the agent's name, id and
-> version; tool spans carry the tool name. Message content is opt-in because of
-> privacy and size. The conventions are still in development, so we pin the
-> schema version and keep our own labels in an `org` namespace."
+> "The GenAI conventions are OpenTelemetry's shared names for AI work.
+> `gen_ai.operation.name` says what a span is (workflow, agent, chat, tool)
+> and sets its name. Chat spans carry model and tokens, agent spans carry
+> identity, tool spans carry the action. Content is opt-in. The conventions
+> are still in development, so we pin the version and keep our own labels
+> under `org.*`."
 
 ## Recap
 
@@ -639,15 +720,6 @@ span. Tool name: the `execute_tool` span. In this repo, `gen_ai.agent.name`
 is on all three, so you can group any of them by agent.
 </details>
 
-<details><summary>Why is a <code>chat</code> span <code>CLIENT</code> but an <code>execute_tool</code> span <code>INTERNAL</code>?</summary>
-
-A chat call normally leaves the process as a network request to the model
-provider, and `CLIENT` means "I called something outside myself". A tool span
-records the tool function running inside the agent process. If that tool
-makes an HTTP request, the request gets its own `CLIENT` span, under the tool
-span.
-</details>
-
 <details><summary>Why is a session not one long trace?</summary>
 
 A session can last hours or days. A trace that long never "finishes", so it
@@ -669,21 +741,12 @@ Any query that sums tokens over a trace would count them twice. Store each
 fact once, on the span where it happened, and aggregate in queries.
 </details>
 
-<details><summary>A provider reports 1,000 input tokens, 800 of them cache reads. What do you record?</summary>
+<details><summary>Mixing with module 2: a LangChain upgrade stops filling <code>usage_metadata</code> on model replies. What breaks, and how would you notice?</summary>
 
-`gen_ai.usage.input_tokens = 1000` and
-`gen_ai.usage.cache_read.input_tokens = 800`. The cache figure is a breakdown
-of the input, not an addition; cost models price the two parts differently.
-If the provider instead reported "200 input, 800 cached" as separate numbers,
-you'd still record 1,000 as the input, because the conventions want the full
-input count.
-</details>
-
-<details><summary>You want to add a "customer tier" label to every agent span. What do you call it?</summary>
-
-Something in your own namespace, such as `org.customer.tier`. Not
-`gen_ai.customer.tier`: the `gen_ai.` prefix belongs to the conventions, and
-a future release could define that name with a different meaning.
+`on_llm_end` finds no usage, so chat spans lose their `gen_ai.usage.*`
+attributes. Nothing errors: `gen_ai_tokens_in` reads `0` for new rows and cost
+dashboards quietly drop. Notice it with an alert on "chat spans with zero
+input tokens" or a golden-trace test after each upgrade.
 </details>
 
 <details><summary>Why doesn't this repo use <code>gen_ai.workflow.name</code>?</summary>
