@@ -1,4 +1,4 @@
-# Module 12: Operational readiness, from gateway to ClickHouse (45 min)
+# Module 12: Operational readiness, from gateway to ClickHouse (50 min)
 
 ## Why this matters
 
@@ -10,8 +10,8 @@ whole pipeline is healthy.
 
 By the end, you'll be able to name the few signals that matter, read the
 repo's one-screen health check (including its blind spots), rehearse two
-outages and watch the check catch them, and work through a production
-readiness checklist. The full per-component catalogue is in the
+outages and watch the check catch them, and size and run the pipeline like a
+service with its own targets. The full per-component catalogue is in the
 [metrics reference appendix](appendix-metrics-reference.md).
 
 ## Key terms
@@ -22,10 +22,9 @@ readiness checklist. The full per-component catalogue is in the
 | **Counter** | A metric that only goes up from when the program started, like a car's odometer |
 | **Gauge** | A metric that goes up and down, like a fuel gauge: queue size, memory, free disk |
 | **Rate** | How much a counter grew per second over a time window. For counters, the rate is what you watch |
-| **Alert** | An automatic message to a person when a metric crosses a threshold for long enough |
+| **Alert** | An automatic message to a person when a metric crosses a threshold for long enough. |
 | **SLI and SLO** | A service level indicator measures what users experience ("age of the newest span"); a service level objective is the target for it ("under 2 minutes, 99.9% of the time") |
 | **Saturation** | How full a resource is: a queue at 90% of capacity, or a disk with 5% free. One more push and something fails |
-| **Back-pressure** | A busy component telling the sender "not now, try later" instead of crashing |
 | **Lag** | How far behind something is: here, how many seconds a replica is behind its peer |
 | **Runbook** | A written, step-by-step "what to do when X happens" for the person on call |
 
@@ -40,88 +39,73 @@ without it, replicated tables go **read-only**: reads work, inserts fail
 
 ### What "operational readiness" means
 
-Think of a car. Driving it is one skill. Knowing that the oil light means
-"stop soon", and having a spare tire and the steps to change it, is another.
-That second skill is operational readiness. For this pipeline, it means:
+Driving a car is one skill. Knowing that the oil light means "stop soon",
+and carrying a spare tire you know how to change, is another: that's
+operational readiness. For this pipeline, it means you **see its health**
+(you know which metrics matter), you **hear about trouble early** (alerts
+fire before data is lost), and you **know what to do** (each likely failure
+has a practiced runbook). The outage labs in modules [4](04-collector.md),
+[7](07-clickhouse.md), [10](10-copying-data.md) and [11](11-s3-tiering.md)
+were that practice. Without it, a tracing system fails silently: spans go
+missing, and nobody notices until they need them.
 
-1. **You can see its health.** You know which metrics matter.
-2. **You hear about trouble early.** Alerts fire before data is lost.
-3. **You know what to do.** Each likely failure has a runbook, and you've
-   practiced it. The labs in modules [4](04-collector.md) (gateway down),
-   [7](07-clickhouse.md) (Keeper and a replica down),
-   [10](10-copying-data.md) (adding a replica) and [11](11-s3-tiering.md)
-   (S3) are those practice runs.
+### Metrics and the four questions
 
-Without it, the most common failure of a tracing system is silent: spans stop
-arriving, or arrive incomplete, and nobody finds out until they need them.
+A **metric** is a named number. `otelcol_exporter_sent_spans_total` is a
+counter ("spans written since the gateway started"): if its rate drops to
+zero, nothing is being written. `otelcol_exporter_queue_size` is a gauge
+("batches waiting now"). Monitoring tools like Prometheus (a system that
+fetches metrics every few seconds and stores them) handle counters resetting
+on restart. A good **alert** fires before users are hurt and always means
+something, so people don't learn to ignore it.
 
-### Metrics, alerts and SLOs in plain words
-
-A **metric** is a named number. **Counters** only go up:
-`otelcol_exporter_sent_spans_total` is "spans written to ClickHouse since the
-gateway started". Its total tells you little; its **rate** tells you a lot. If
-it stops rising, nothing is being written. **Gauges** go up and down:
-`otelcol_exporter_queue_size` is "batches waiting right now". Counters reset
-to zero on restart; monitoring tools like Prometheus (a popular system that
-fetches metrics every few seconds and stores them) handle that.
-
-An **alert** is a rule over a metric: "if the gateway's queue is more than
-half full for 5 minutes, message the on-call person." Good alerts fire
-**before** users are hurt, and they **mean something**, so people don't learn
-to ignore them. An **SLO** turns "is it OK?" into a yes or no question. Two
-examples (not values from this repo): the newest span is under 2 minutes old
-99.9% of the time; p95 trace lookup time (95% of queries are faster) is under
-1 second.
-
-### Four questions every metric answers
-
-| Question | Plain words | How to measure it here |
-|---|---|---|
-| **Is data arriving?** (freshness) | Are new spans showing up? | Age of the newest span: `dateDiff('second', max(Timestamp), now())` on `otel.otel_traces` |
-| **Is data complete?** (loss) | Are spans going missing on the way? | Gateway refused, lost and filtered counters; SDK export errors in app logs |
-| **Is it keeping up?** (saturation) | Is anything running out of room or falling behind? | Gateway queue; `system.replicas`, `system.parts`, `system.disks` |
-| **Can people use it?** (query health) | Do queries come back quickly and without errors? | `system.query_log` |
-
-`Timestamp` is a `DateTime64` (time with fractions of a second), so use
-`dateDiff('second', ...)` to get a plain number of seconds rather than
-subtracting it from `now()`.
+Every signal in this module answers one of four questions: **is data
+arriving** (freshness), **is it complete** (no loss), **is the system keeping
+up** (saturation), and **can people use it** (query health).
 
 ### Where spans can be lost
 
-Follow the HR agent's "I need a new laptop" request
-([module 13](13-cheat-sheet.md) retells it end to end). Its spans travel:
+Follow the HR agent's "I need a new laptop" request. Its spans travel:
 
 ```text
- app SDK ──▶ gateway receiver ──▶ processors ──▶ export queue ──▶ ClickHouse ──▶ Keeper
-    │              │                    │               │               │            │
- queue full,   memory limiter      filter drops     queue full,     too many     down: tables
- process exits refuses data        (by design)      exporter        parts,       go read-only
- (lost)        (app must retry)                     gives up        disk full,
-                                                    (lost)          read-only
+ app SDK ──▶ receiver ──▶ processors ──▶ export queue ──▶ exporter ──▶ ClickHouse ──▶ Keeper
+    │            │             │              │               │             │            │
+ queue full,  memory_limiter  filter drops   full: new      gives up      too many    down: tables
+ or process   refuses         (by design)    batch dropped  after 300 s   parts, disk go read-only
+ exits (lost) (not lost yet)                 (lost)         (lost)        full, memory
 ```
 
 1. **App SDK.** Holds finished spans in memory (2048 by default). If the
-   gateway is unreachable for long, the queue fills and spans are dropped; if
-   the process exits first, they're gone. No gateway counter sees this.
-2. **Gateway receiver.** Near its memory limit, `memory_limiter` refuses new
-   data; the app retries, but its own queue may fill.
+   gateway is unreachable for long, the queue fills and new spans are
+   dropped; if the process exits first, they're gone. No gateway counter
+   sees this.
+2. **Receiver.** Near its memory limit, `memory_limiter` refuses new data.
+   That's not a loss yet: the SDK keeps the spans and retries.
 3. **Processors.** `filter/require_org_labels` drops spans without
    `org.owner` or `org.service`: loss by design, like the laptop request's
    `legacy-hr-api` span ([module 4](04-collector.md)).
-4. **Export queue.** Batches wait for ClickHouse; ones that can't be written
-   within 300 s (`max_elapsed_time`) are dropped.
-5. **ClickHouse** can reject inserts (too many parts, disk full, memory), and
-   **Keeper** down makes tables read-only, so the gateway queues and retries.
+4. **Export queue.** When it already holds 1000 batches, each new batch is
+   dropped on arrival (`enqueue_failed`). A gateway restart also empties it:
+   it lives in memory.
+5. **Exporter.** A batch it has retried for 300 s (`max_elapsed_time`) is
+   dropped (`send_failed`).
+6. **ClickHouse** can reject inserts (too many parts, disk full, memory), and
+   **Keeper** down makes tables read-only. Both turn into exporter retries,
+   so they become loss only through steps 4 and 5.
 
-### Queues, back-pressure and lag
+> **Remember from module 4:** only `memory_limiter` pushes back on the apps.
+> The queue and the exporter drop data silently: the apps think it arrived.
 
-Picture a coffee shop. A **queue** is the line: one that comes and goes is
-healthy; one that keeps growing means the barista can't keep up. The
-gateway's export queue holds up to 1000 batches (the default; the config sets
-no `sending_queue`). **Back-pressure** is the sign on the door, "full, come
-back in five minutes": better than collapsing. That's `memory_limiter`.
-**Lag** is how far behind the second barista is: if the second replica is 90
-seconds behind, queries sent to it miss the last 90 seconds of spans.
+> **Quick check:** ClickHouse is down for 20 minutes. Which gateway loss
+> counter rises first, and which one later?
+>
+> <details><summary>Answer</summary>
+>
+> Usually `send_failed`, after 300 s, as the batches being retried run out of
+> time. `enqueue_failed` follows once the queue holds 1000 batches. If
+> batches arrive faster than about 3 a second, the queue fills before 300 s
+> and the order flips.
+> </details>
 
 ### The books must balance
 
@@ -131,9 +115,20 @@ The gateway counts every way a span can leave it. Like a bank statement:
 
 Accepted is what the receiver took in; filtered, what the label filter
 dropped; sent, what reached ClickHouse; in queue or batch, what's waiting (the
-`batch` processor holds spans up to 5 s); failed, what the exporter gave up on
-or found the queue full. If the numbers don't add up over time, something is
-losing data in a way no counter shows.
+`batch` processor holds spans up to 5 s); failed, `send_failed` plus
+`enqueue_failed`. If the numbers don't add up over time, something is losing
+data in a way no counter shows.
+
+> **Quick check:** accepted 1000, filtered 20, sent 900, lost 0, and the queue
+> is empty. A minute later the numbers haven't changed. Where are the other
+> 80 spans?
+>
+> <details><summary>Answer</summary>
+>
+> Unaccounted for. The `batch` processor flushes within 5 s and the queue is
+> empty, so 80 spans are stuck or were dropped where no counter sees it.
+> That's what the books are for: start with the gateway's log.
+> </details>
 
 ### The ten signals that matter most
 
@@ -142,7 +137,7 @@ ten cover the four questions:
 
 | Question | Signal | Where | Bad looks like |
 |---|---|---|---|
-| Arriving | Age of the newest span | `dateDiff('second', max(Timestamp), now())` | Over 2 minutes while traffic runs |
+| Arriving | Age of the newest span | `dateDiff('second', max(Timestamp), now())` on `otel.otel_traces` | Over 2 minutes while traffic runs |
 | Arriving | Spans accepted | `otelcol_receiver_accepted_spans_total` (rate) | Drops to zero while apps run |
 | Complete | Spans lost | `otelcol_exporter_send_failed_spans_total` + `otelcol_exporter_enqueue_failed_spans_total` (rate) | Any increase |
 | Complete | Spans refused | `otelcol_receiver_refused_spans_total` (rate) | A sustained rate |
@@ -153,11 +148,11 @@ ten cover the four questions:
 | Keeping up | Local disk free | `free_space / total_space` in `system.disks` | Under 15% |
 | Usable | Query latency and errors | `system.query_log`, `system.errors` | p95 over your SLO; new error names |
 
-A note on "lost". `send_failed` counts spans the exporter **gave up on**, not
-only retries that ran out. Retryable errors (ClickHouse down, a timeout) are
-retried for up to 300 s; errors an exporter marks as permanent are dropped at
-once. Either way, an error that retrying can't fix, such as a schema mismatch
-between the exporter and the table, fails every batch until you fix the cause.
+`Timestamp` is a `DateTime64` (time with fractions of a second), so use
+`dateDiff('second', ...)` to get a plain number of seconds.
+
+`send_failed` also counts permanent errors, dropped at once without retries.
+A schema mismatch fails every batch until you fix it.
 
 ### Totals versus rates
 
@@ -168,10 +163,19 @@ inserts and S3 request errors on ClickHouse. So a single blip, say one failed
 S3 request at 5 a.m., keeps that line at WARN or FAIL until the gateway or
 server restarts, even if nothing has gone wrong since.
 
-That's a simplification: a script that runs once has no history to compute a
-rate from. When one of those lines isn't OK, your next question is "is it
-still rising?". Lab 1 shows two ways to answer it. A real monitoring setup
-(Prometheus scraping the gateway, alerting on the rate) answers it for you.
+A script that runs once has no history to compute a rate from. So when one
+of those lines isn't OK, ask "is it still rising?"; lab 1 shows two ways to
+answer. Prometheus, alerting on the rate, answers it for you.
+
+> **Quick check:** the check shows `WARN refused 12 spans` on a gateway that
+> has run for a week. Should you page someone?
+>
+> <details><summary>Answer</summary>
+>
+> Not yet. Refused spans aren't lost, and 12 in a week may be one old blip.
+> Sample the counter twice a minute apart: if it's still rising, memory is
+> under pressure now; if not, it's history.
+> </details>
 
 ## Remember it
 
@@ -185,11 +189,10 @@ still rising?". Lab 1 shows two ways to answer it. A real monitoring setup
   8888, mapped to <http://localhost:18888/metrics>; `health_check` answers on
   13133. `memory_limiter.limit_mib` is 512, `max_elapsed_time` is 300 s, and
   the exporter's `endpoint` lists both ClickHouse nodes.
-- `compose.yaml` sets **no container memory limits**. The gateway's only
-  memory cap is `memory_limiter`. Each ClickHouse server sets its own limit
-  (`max_server_memory_usage`, 90% of RAM by default) from the whole Docker
-  machine's RAM, which both servers and the gateway share, so "memory N% of
-  the server limit" is optimistic here. In production, set container limits
+- `compose.yaml` sets **no container memory limits**: the gateway's only cap
+  is `memory_limiter`, and each ClickHouse server sets its limit (90% of RAM)
+  from the whole Docker machine, which all three share. So "memory N% of the
+  server limit" is optimistic here. In production, set container limits
   (gateway: about 20% above `limit_mib`).
 - `docs/tutorial/labs/health-check.sh` (also `./stack.sh health`): one screen
   covering the gateway, Keeper and both ClickHouse nodes. It reads the
@@ -197,6 +200,52 @@ still rising?". Lab 1 shows two ways to answer it. A real monitoring setup
   node with `docker exec`. Thresholds are demo starting points. Every line is
   explained in the
   [appendix](appendix-metrics-reference.md#the-health-check-line-by-line).
+
+## Principal engineer's notes
+
+**Touch points**
+- App to gateway: OTLP/HTTP on 4318 (14318 on the host). A refusal is a
+  retryable error, so SDK retry and queue settings matter as much as the
+  gateway's.
+- Gateway to ClickHouse: native protocol on 9000; the contract is the stock
+  columns ([module 8](08-data-model.md)). With `create_schema: false`, a
+  breaking schema change shows up as `send_failed`.
+- ClickHouse to Keeper on 9181: each insert registers a part per replicated
+  table, so one gateway insert plus 3 materialized views is up to 4 Keeper
+  writes.
+
+**SLOs for the pipeline itself**
+- **Delivery**: sent / (accepted - filtered) per hour, say 99.9%. It can't
+  see SDK loss, so add a synthetic trace every minute.
+- **Freshness**: that synthetic trace is queryable within 60 s, 99% of the
+  time. This is the end-to-end lag users feel.
+- **Query latency**: p95 trace lookup by `TraceId` under 1 s
+  (`system.query_log`).
+- **Page on symptoms** (an SLO at risk, `lost` rising); **ticket the
+  causes** (parts, disk, lag, Keeper latency). Many causes never hurt anyone.
+
+**At scale: capacity planning**
+- Disk = spans/s x bytes/span x 86400 x retention days x replicas x 1.3.
+  This stack's busiest hour: 5 x 53 bytes (619 raw) x 86400 x 3 x 2 x 1.3 is
+  about 180 MB. At 1000 spans/s of real 300-byte spans: about 200 GB.
+- Inserts per second hurt before rows do. Each gateway inserts per 1000 spans
+  or 5 s; many gateways mean many small parts and Keeper writes. Bigger
+  batches or `async_insert` are the knob.
+- The queue's real limit is memory: 1000 batches of 1000 spans at 600+ bytes
+  is over 600 MB, past the 512 MiB `memory_limiter`. Refusals come first.
+
+**Operational issues**
+- Keep self-monitoring **outside** the pipeline: alerts stored in the
+  ClickHouse they watch go silent when it fails. Add a "dead man's switch",
+  an always-firing alert whose silence pages.
+- Every alert links to a runbook (symptom, checks, fix, verify, undo). The
+  outage labs are small **game days**, rehearsed failures; repeat them in
+  staging and check that the books balance afterwards.
+
+**Design trade-offs**
+- In-memory queue (here) versus `file_storage`: a disk queue survives
+  restarts but costs disk I/O. Choose it when losing a restart's worth of
+  spans is unacceptable.
 
 ## Lab 1 (15 min): read the health check
 
@@ -286,10 +335,8 @@ still rising?". Lab 1 shows two ways to answer it. A real monitoring setup
 The health check tells you about today. Before calling the pipeline
 production-ready, work through these:
 
-- **Capacity**: measure spans per second and bytes per span (stretch
-  exercise A) and size disk for retention plus 30%; size the gateway queue for
-  the longest ClickHouse outage you'll accept; set container memory limits
-  (this demo sets none).
+- **Capacity**: disk from your own numbers (stretch exercise A); gateway
+  queue and memory for the longest outage you'll accept; container limits.
 - **Redundancy**: 2 or more gateways behind a load balancer; 3 Keepers; 2 or
   more ClickHouse replicas per shard, on separate hosts or zones.
 - **Durability**: a persistent gateway queue (`sending_queue.storage` with
@@ -298,11 +345,10 @@ production-ready, work through these:
 - **Security**: TLS on OTLP and the ClickHouse ports; no passwords in config
   files (this demo's `demo` password is for a laptop only); separate
   ClickHouse users, so the gateway can only insert and readers can only read,
-  with quotas.
+  with quotas (per-user limits on queries, rows read and run time).
 - **Watching the pipeline itself**: scrape the gateway (`:8888`) and
-  ClickHouse (`:9363`, once enabled) into Prometheus; alert on the **rate** of
-  the ten signals, not all-time totals; send a synthetic trace (a fake request
-  just to check it arrives) every minute and alert if it doesn't.
+  ClickHouse (`:9363`, once enabled) into a separate Prometheus; alert on
+  rates and SLOs; send a synthetic trace every minute.
 - **Change safety**: pin image versions, as `compose.yaml` does; validate the
   Collector config in CI (`otelcol-contrib validate --config=...`); make
   schema changes add-only and `ON CLUSTER`; upgrade one replica at a time.
@@ -353,10 +399,21 @@ production-ready, work through these:
    A minute after starting Keeper the check is back to OK, except the errors
    line, which stays for its 10-minute window.
 
+> **Quick check:** in production, Keeper is down and you have 1 gateway with
+> the default in-memory queue. How long do you have before spans are lost,
+> and what would shorten that?
+>
+> <details><summary>Answer</summary>
+>
+> About 300 s: after that, the batches the exporter is retrying start to be
+> dropped. A full queue (or, on a busy gateway, `memory_limiter` refusing
+> data) would shorten it, and a gateway restart would lose the queue at once.
+> </details>
+
 ### Stretch exercises (optional)
 
-**A. Size the disk from your own data.** Bytes per row, then spans per second
-over the last 10 minutes (needs the traffic loop running):
+**A. Measure your own capacity numbers.** Bytes per row, then spans per
+second over the last 10 minutes (needs the traffic loop running):
 
 ```sql
 SELECT table, sum(rows) AS n,
@@ -368,11 +425,9 @@ SELECT round(count() / dateDiff('second', min(Timestamp), max(Timestamp)), 1) AS
 FROM otel.otel_traces WHERE Timestamp > now() - INTERVAL 10 MINUTE;
 ```
 
-A test run measured 54 bytes per span on disk (615 raw) at 3.5 spans per
-second; real spans are often several times larger. Then
-`disk = spans/s x bytes/span x 86400 x retention days x replicas x 1.3`
-(86400 seconds a day, 30% headroom). For example, 1000 spans per second at
-300 bytes, kept 3 days on 2 replicas, is roughly 200 GB.
+A test run measured 53 bytes per span on disk (619 raw). Real spans, with
+prompts and longer attributes, are often several times larger. Use your
+numbers in the disk formula from the principal engineer's notes.
 
 **B. Find the heaviest queries.** The last hour's `SELECT` queries, grouped
 by shape (`normalizeQuery` replaces literal values), 5 slowest by p95:
@@ -393,33 +448,29 @@ the cheapest fix.
 
 ## Explain it back
 
-> "Operating the pipeline means answering four questions: is data fresh, is
-> it complete, is the system keeping up, and can people query it. Spans can be
-> lost in the SDK, at the gateway's memory limiter, when the exporter gives
-> up, and in ClickHouse or Keeper. About ten signals cover it: freshness, the
-> gateway's accepted, lost, refused and filtered counters and its queue, parts
-> per partition, read-only replicas and lag, disk, and query health. For
-> counters I watch the rate: the health check flags some lines from all-time
-> totals, so WARN there means 'check whether it's still rising'. Readiness
-> adds redundancy, persistent queues, tested backups, memory limits, security,
-> and a rehearsed runbook for each failure."
+> "Operating the pipeline means four questions: is data fresh, complete,
+> keeping up, and usable. Spans are lost in the SDK, at a full export queue,
+> on a gateway restart, or when the exporter gives up after 300 s; refusals
+> aren't loss yet. The gateway's books must balance, and for counters I watch
+> the rate. I set SLOs on delivery, freshness and query latency, page on
+> symptoms, keep monitoring outside the pipeline, size disk from spans per
+> second and bytes per span, and rehearse runbooks as game days."
 
 ## Recap
 
-- Readiness: see the pipeline's health, hear about trouble early, know what
-  to do.
 - Four questions (fresh, complete, keeping up, usable), about ten signals;
   the appendix has the rest.
-- SDK loss shows up only as freshness. The gateway's books must balance, and
-  `send_failed` means the exporter gave up: after retries, or at once for
-  permanent errors.
+- Loss happens in the SDK, at a full export queue (`enqueue_failed`), on a
+  gateway restart, and when the exporter gives up (`send_failed`). Refusals
+  are back-pressure, not loss. The books must balance.
 - Counters: watch the rate. The health check's `refused`, `lost`, delayed
   inserts and S3 lines are all-time totals; use `system.metric_log` or two
   samples to see whether they're still rising.
-- This repo sets no container memory limits, so its memory percentages are
-  optimistic.
-- The exporter fails over between ClickHouse nodes, so the gateway queue only
-  grows when both are down.
+- Run the pipeline as a service: SLOs on delivery, freshness and query
+  latency; page on symptoms; monitoring stored elsewhere; capacity from
+  spans/s x bytes/span x retention x replicas.
+- The exporter fails over between ClickHouse nodes; the queue grows only
+  when both are down.
 
 ## Check yourself
 
@@ -438,25 +489,27 @@ hours ago keeps it at WARN until the server restarts. Group
 history; if they're rising, check credentials and the endpoint.
 </details>
 
-<details><summary>Why is <code>otelcol_exporter_send_failed_spans_total</code> the most important alert?</summary>
-
-It counts spans the exporter dropped for good, after retries ran out or at
-once for permanent errors. Other signals warn that loss may come; this one
-says it happened.
-</details>
-
-<details><summary>You stop only <code>clickhouse-01</code>, and the gateway queue stays at 0. Why?</summary>
+<details><summary>You stop only <code>clickhouse-01</code>, and the gateway queue stays at 0. Why? (mixes module 7)</summary>
 
 The exporter's endpoint lists both nodes. When one is down, the client
 connects to the other and inserts keep succeeding; `clickhouse-01` catches up
 through replication when it returns.
 </details>
 
-<details><summary>The health check says <code>memory 5% of the server limit</code>. Is there plenty of headroom?</summary>
+<details><summary>Your team stores the gateway's metrics in the same ClickHouse cluster and alerts from there. What goes wrong?</summary>
 
-Less than it looks. `compose.yaml` sets no container memory limit, so each
-ClickHouse server sets its limit from the whole Docker machine's RAM, which
-both servers and the gateway share.
+When ClickHouse is down, the metrics and the alerts go with it, so the outage
+you most need to hear about is silent. Store self-monitoring separately, and
+add an always-firing "dead man's switch" alert so silence itself pages.
+</details>
+
+<details><summary>With S3 tiering on, you backfill last month's spans with <code>remote()</code>, and S3 write errors start rising. Are live spans from the gateway at risk? (mixes modules 10 and 11)</summary>
+
+Not directly. Move rules apply at insert time, so only the backfilled rows,
+already past the move age, go straight to S3; that `INSERT` fails and reports
+it to whoever runs it. Live spans are seconds old and land on local disk, so
+`lost` and freshness stay OK. The risk comes later: if background moves keep
+failing, the local disk fills.
 </details>
 
 <details><summary>The health check says <code>newest span 900s old</code>, but everything else is OK. What's the likely cause?</summary>
@@ -471,8 +524,8 @@ export errors.
 
 You've now seen every piece of the pipeline, from the first span to the
 on-call screen. [Module 13](13-cheat-sheet.md) pulls it all together: one
-request followed end to end, a cheat sheet and glossary, and interview-style
-questions to test yourself.
+request followed end to end, a cheat sheet and glossary, and interview and
+design review questions to test yourself.
 
 ## Read more
 
@@ -486,3 +539,4 @@ questions to test yourself.
 - [Backup and restore](https://clickhouse.com/docs/operations/backup)
 - [Prometheus: metric types](https://prometheus.io/docs/concepts/metric_types/)
 - [Google SRE book: service level objectives](https://sre.google/sre-book/service-level-objectives/)
+- [Google SRE workbook: alerting on SLOs](https://sre.google/workbook/alerting-on-slos/)

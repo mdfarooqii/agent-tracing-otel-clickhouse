@@ -184,8 +184,9 @@ because nothing has failed yet. The health check treats a missing counter as
 - Why it matters: every batch becomes one ClickHouse insert, and every insert
   makes a part. Tiny batches mean many tiny parts.
 - Bad value: mostly tiny batches on a busy system.
-- What to do: fewer senders writing straight to ClickHouse, or a larger
-  `timeout` in the `batch` processor.
+- What to do: raise the `batch` processor's `timeout` or `send_batch_size`.
+  With many gateways, each sends its own small batches, so fewer, larger
+  gateways (or `async_insert` in ClickHouse) also help.
 
 **Health check endpoint `:13133`**
 
