@@ -34,7 +34,7 @@
                         <disk>s3_cache</disk>
                     </cold>
                 </volumes>
-                <!-- Also move the oldest parts to S3 when the local disk has less than 10% free. -->
+                <!-- Also move parts to S3, largest first, when the local disk has less than 10% free. -->
                 <move_factor>0.1</move_factor>
             </tiered>
         </policies>
