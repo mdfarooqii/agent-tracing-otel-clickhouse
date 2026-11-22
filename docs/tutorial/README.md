@@ -235,7 +235,7 @@ mixed review of modules 0 to 6.
 |---|---|---|---|
 | 7 | [ClickHouse storage, replicas and Keeper](07-clickhouse.md) | 45 min | Parts, partitions, the sorting key, replication, what fails and how |
 | 8 | [The data model](08-data-model.md) | 40 min | Every column and table in `schema.sql`, and which summary table answers which question |
-| 9 | [Sharding, trace locality and indexes](09-sharding-indexes.md) | 38 min | Why all spans of a trace land on one shard; skip indexes |
+| 9 | [Sharding, trace locality and indexes](09-sharding-indexes.md) | 45 min | How a cluster is laid out; why all spans of a trace land on one shard; skip indexes |
 | 10 | [Adding a replica and copying data](10-copying-data.md) | 38 min | A third replica, `remote()`, FETCH/ATTACH PARTITION, safe incremental copies |
 | 11 | [Moving older data to S3](11-s3-tiering.md) | 45 min | Disks, storage policies and TTL moves; local S3 with SeaweedFS; real S3 settings |
 | 12 | [Operational readiness, gateway to ClickHouse](12-operations.md) | 50 min | The signals to watch, reading the health check, and a production checklist |

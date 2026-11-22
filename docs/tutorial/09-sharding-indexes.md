@@ -1,4 +1,4 @@
-# Module 9: Sharding, trace locality and indexes (38 min)
+# Module 9: Sharding, trace locality and indexes (45 min)
 
 ## Why this matters
 
@@ -15,6 +15,8 @@ the table's sorting key.
 
 - Draw the difference between replicas and shards.
 - Explain what a `Distributed` table does on insert and on select.
+- Explain why shards belong to the cluster while each table picks its own
+  sharding key, and how a small table is copied to every server instead.
 - Explain why sharding by `cityHash64(TraceId)` keeps every trace on one
   shard, and why that matters.
 - Pick a skip index (bloom filter, `minmax`, `set`) for a filter, and check
@@ -30,6 +32,7 @@ background job that rewrites existing parts ([module 8](08-data-model.md)).
 | Term | Plain meaning |
 |---|---|
 | Shard | A **slice** of the data. Each shard holds different rows |
+| Cluster definition | A named list of servers, grouped into shards and replicas, in the `<remote_servers>` section of the server config. Tables refer to it by name |
 | Local table | The ordinary table on each server that actually stores that shard's rows |
 | `Distributed` table | A table that stores nothing. It forwards inserts to shards and collects query results from them |
 | Sharding key | An expression computed for each row that decides which shard it goes to, usually a hash (a function that turns a value into a number; same input, same number) |
@@ -146,6 +149,128 @@ into `otel_traces`, and replication copies it. The comment at the top of
 > <details><summary>Answer</summary>
 >
 > Probably not. The insert returned once the rows were queued on the server you wrote to; they reach the shards a moment later. Count again. Rows are only at risk if that queue can't drain, for example while a shard is down.
+> </details>
+
+### Shards belong to the cluster; each table picks its own key
+
+**The problem.** It's easy to picture shards as something each table has.
+They aren't. Which servers exist, and how they're grouped into shards and
+replicas, is decided once for the whole cluster. Tables only decide *how
+their rows are spread* over that layout. Keeping these two apart explains
+why a sharded table always comes as a pair, and how a small table can live
+on every server without being split.
+
+A picture to hold on to: the cluster is an office building. The floors are
+the shards, and each floor has two identical rooms, the replicas. The
+building is the same for everyone. Each table (each team) has its own rule
+for which floor a row goes to.
+
+**1. The layout is defined once, in `<remote_servers>`.** Each server's
+config has a `<remote_servers>` section that lists named clusters. Each
+cluster lists its shards, and each shard lists its replicas. This repo's
+`clickhouse/cluster.xml`, trimmed:
+
+```xml
+<remote_servers>
+    <tracing>                            <!-- cluster name used by tables -->
+        <shard>                          <!-- one shard ... -->
+            <internal_replication>true</internal_replication>
+            <replica><host>clickhouse-01</host><port>9000</port></replica>
+            <replica><host>clickhouse-02</host><port>9000</port></replica>
+        </shard>                         <!-- ... with two replicas -->
+    </tracing>
+    <lab_2shards>                        <!-- same two servers, seen as two shards -->
+        <shard><replica><host>clickhouse-01</host><port>9000</port></replica></shard>
+        <shard><replica><host>clickhouse-02</host><port>9000</port></replica></shard>
+    </lab_2shards>
+</remote_servers>
+```
+
+A cluster definition is only a named list of addresses. Nothing is created
+on disk by writing it, which is why the same two servers can appear in two
+clusters.
+
+**2. A table never lists servers; it names a cluster.** It does that in two
+places:
+
+- `ON CLUSTER tracing` in a `CREATE TABLE` runs the statement on every
+  server the cluster lists. That's how each server gets its own **local
+  table**.
+- The first argument of a `Distributed` table, as in
+  `Distributed(lab_2shards, ...)`, tells it which shards to route between.
+
+So a sharded table is always a pair: a local table on every server holding
+that server's slice, and a `Distributed` table on top that routes inserts
+and fans queries out.
+
+```text
+                 Distributed table: spans (stores nothing)
+                 key = cityHash64(TraceId)
+                    |                      |
+          shard 1   v            shard 2   v
+   clickhouse-01  spans_local     clickhouse-03  spans_local
+   clickhouse-02  spans_local     clickhouse-04  spans_local
+                  (same rows)                    (same rows)
+```
+
+**3. The servers are shared; the sharding key is per table.** Two tables
+on the same cluster can spread their rows differently. Spans use
+`cityHash64(TraceId)` so a whole trace lands on one shard. A table of
+conversation summaries could use `cityHash64(conversation_id)` so one
+conversation lands on one shard. Same building, different floor rules.
+
+**4. A small table can be copied everywhere instead of split.** Sharding a
+table of 200 rows only makes every query ask every shard. Better to keep a
+full copy on every server, so any server can answer, or join against it,
+alone. The usual way is a second cluster definition over the same servers,
+with **one shard that lists every server as a replica**. For a 2 × 2
+production cluster:
+
+```xml
+<remote_servers>
+    <traces>                <!-- 2 shards x 2 replicas: for big tables -->
+        <shard><internal_replication>true</internal_replication>
+            <replica><host>ch-01</host><port>9000</port></replica>
+            <replica><host>ch-02</host><port>9000</port></replica></shard>
+        <shard><internal_replication>true</internal_replication>
+            <replica><host>ch-03</host><port>9000</port></replica>
+            <replica><host>ch-04</host><port>9000</port></replica></shard>
+    </traces>
+    <single>                <!-- 1 shard x 4 replicas: for small tables -->
+        <shard><internal_replication>true</internal_replication>
+            <replica><host>ch-01</host><port>9000</port></replica>
+            <replica><host>ch-02</host><port>9000</port></replica>
+            <replica><host>ch-03</host><port>9000</port></replica>
+            <replica><host>ch-04</host><port>9000</port></replica></shard>
+    </single>
+</remote_servers>
+```
+
+```sql
+CREATE TABLE ref.agents ON CLUSTER single
+(agent_name String, owner String, tier LowCardinality(String))
+ENGINE = ReplicatedMergeTree('/clickhouse/tables/single/{database}/{table}', '{replica}')
+ORDER BY agent_name;
+```
+
+`ON CLUSTER single` creates the table on all four servers. One catch: the
+Keeper path (module 7) decides which servers count as copies of each
+other. The default path ends in `{shard}`, and each server's `{shard}`
+macro still says 1 or 2 from the big cluster, so the default would make
+two separate groups. The explicit path above has no `{shard}`, so all four
+servers join one group and hold the same rows. Insert on any server, and
+replication copies it to the other three.
+
+This repo's real cluster is exactly this shape: `tracing` is one shard
+with every server as a replica. That's why its tables are replicated but
+not split, and why it needs no `Distributed` tables. `lab_2shards` is the
+opposite view of the same two servers.
+
+> **Quick check:** A 3 x 2 cluster has a 300-row `agents` table that dashboards join with spans to show each agent's owner. Should it be sharded by `cityHash64(agent_name)`?
+>
+> <details><summary>Answer</summary>
+>
+> No. Sharded, every join would have to fetch agents from the other shards. Copy it to all six servers instead (one shard, every server a replica), so each shard joins against its local copy. Shard only when a table is too big for one server or gets too many writes.
 > </details>
 
 ### Why `cityHash64(TraceId)` keeps a trace together
@@ -537,6 +662,10 @@ You can follow it in `system.mutations`.
   capacity. Real clusters use both.
 - A `Distributed` table stores nothing: it routes inserts by the sharding
   key and merges query results from all shards.
+- Shards and replicas are defined once per cluster in `<remote_servers>`.
+  A sharded table is a local table on every server plus a `Distributed`
+  table, and each table picks its own sharding key. A small table goes on a
+  one-shard cluster of all servers, so every server holds a full copy.
 - Sharding by a hash of the trace id keeps each trace on one shard, spreads
   load evenly, and lets a trace lookup ask just one shard. This repo has one
   shard, so no `Distributed` tables; the lab uses `lab_2shards`.
