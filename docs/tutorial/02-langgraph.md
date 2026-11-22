@@ -60,9 +60,9 @@ of **messages**: usually a **system message** (standing instructions such as
 words). It returns one reply message and reports how many tokens it read and
 wrote. That's one LLM call, also called a **chat call**. In this repo the
 model is a fake one (`FakeChatModel` in `agent/graph.py`) that waits a little,
-returns a canned reply, and reports word counts as token counts. That means
-the whole stack runs without an API key or any cost, but it looks to the rest
-of the code exactly like a real model.
+returns a canned reply, and reports word counts as token counts. The stack
+runs with no API key and no cost, yet the rest of the code can't tell it from
+a real model.
 
 **Tool.** An LLM can only produce text. It can't search a database or open a
 ticket. A tool is a normal Python function that the agent may run to act on
