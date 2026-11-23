@@ -322,22 +322,26 @@ for about 10 real ones. And because tail sampling keeps *all* errors but only
 The numbers you usually want per service are **RED metrics**: rate (requests
 counted), errors, and duration (latency). Two ways to keep them right:
 
-- Compute them **before** sampling. A connector (module 4) can't sit "ahead of"
-  a processor inside one pipeline, so you use two pipelines that both receive
-  from `otlp`, and each gets every span. The first exports to the
-  `spanmetrics` connector, which turns every span into RED metrics and feeds
-  them to a metrics pipeline. The second runs `tail_sampling` and writes the
-  kept traces to ClickHouse. (The smart sampling lab below sets this up.)
+- Compute them **before** sampling, inside the gateway. The SDKs still send
+  each span once; the split happens in the gateway. It can't be a processor:
+  a processor's output is the same kind of data as its input (spans in,
+  spans out), and span metrics turn spans into *metrics*. Something that
+  takes in one kind and puts out another is a **connector** (module 4): it
+  ends one pipeline and starts another. So the first traces pipeline does the
+  shared work once (memory limit, filter, labels) and ends in two
+  connectors. `spanmetrics` turns every span into RED metrics for a metrics
+  pipeline. `forward` passes the same spans, unchanged, to a second traces
+  pipeline, which runs `tail_sampling` and writes the kept traces to
+  ClickHouse. (The smart sampling lab below sets this up.)
 - Or weight each stored trace by its **adjusted count**: 1 divided by the
   probability it was kept. A trace kept at 10% counts as 10; an error trace
   kept at 100% counts as 1. This needs the probability stored with the trace.
 
 ```mermaid
 flowchart LR
-  R[otlp receiver] --> P1["traces pipeline 1:<br/>no sampling"]
-  R --> P2["traces pipeline 2:<br/>tail_sampling, batch"]
+  R[otlp receiver] --> P1["traces pipeline:<br/>limit, filter, labels"]
   P1 --> SM[spanmetrics connector] --> M["metrics pipeline"] --> MB[(metrics store)]
-  P2 --> CH[(ClickHouse)]
+  P1 --> F[forward connector] --> P2["traces/sampled pipeline:<br/>tail_sampling, batch"] --> CH[(ClickHouse)]
 ```
 
 In this repo, the `otel.span_red_1m` table (calls, errors and latency per
@@ -515,10 +519,10 @@ Split the job into three questions, each answered by a different tool:
 
 ```mermaid
 flowchart LR
-  R[otlp receiver] --> A["traces/all:<br/>no sampling"]
-  R --> S["traces:<br/>tail_sampling, batch"]
+  R[otlp receiver] --> A["traces:<br/>limit, filter, labels"]
   A --> SM[spanmetrics] --> M["metrics pipeline"]
   A --> SG[servicegraph] --> M
+  A --> F[forward] --> S["traces/sampled:<br/>tail_sampling, batch"]
   M --> CH[(ClickHouse)]
   S --> CH
 ```

@@ -28,6 +28,8 @@ connectors:
     # or LLM provider) becomes an edge to a "virtual" node named by these.
     virtual_node_peer_attributes: [db.system.name, gen_ai.provider.name]
     metrics_flush_interval: 15s
+  # Passes spans unchanged from one traces pipeline into another.
+  forward: {}
 
 processors:
   # Turns the cumulative service-graph counters into per-interval deltas,
@@ -75,15 +77,16 @@ processors:
 
 service:
   pipelines:
-    # Every span, unsampled: feeds the two connectors, stores nothing itself.
-    traces/all:
-      receivers: [otlp]
-      processors: [memory_limiter, filter/require_org_labels, resource/org_platform]
-      exporters: [spanmetrics, servicegraph]
-    # Stored traces: only what tail sampling keeps.
+    # Every span, processed once, then handed to the two connectors and to
+    # `forward`. Named `traces` so it replaces the main file's pipeline.
     traces:
       receivers: [otlp]
-      processors: [memory_limiter, filter/require_org_labels, resource/org_platform, tail_sampling, batch]
+      processors: [memory_limiter, filter/require_org_labels, resource/org_platform]
+      exporters: [spanmetrics, servicegraph, forward]
+    # The same spans, passed on by `forward`; only what tail sampling keeps is stored.
+    traces/sampled:
+      receivers: [forward]
+      processors: [tail_sampling, batch]
       exporters: [clickhouse, debug]
     metrics:
       receivers: [spanmetrics, servicegraph]
