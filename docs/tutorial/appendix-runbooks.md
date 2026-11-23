@@ -816,8 +816,10 @@ with the incoming rate.
 **Fix.** Fix the ClickHouse cause first. Then, if needed: more gateways
 behind the load balancer (with tail sampling, behind a trace-id-aware
 `loadbalancing` tier, [module 5](05-sampling.md)); bigger batches; more
-`sending_queue` consumers. A permanent error (schema mismatch, `send_failed`
-right away, no retries) needs a schema or config fix.
+`sending_queue` consumers. A schema mismatch (`code: 16, message: No such
+column ...` in the log) is retried like any other error, so it fills the
+queue and drops batches after `max_elapsed_time`: restore the column the
+exporter expects ([module 8](08-data-model.md#schema-evolution-new-attributes-and-new-columns)).
 
 **Prevent.** A persistent queue (`sending_queue.storage` with
 `file_storage`) so a restart doesn't drop it; alert on the queue fill and on

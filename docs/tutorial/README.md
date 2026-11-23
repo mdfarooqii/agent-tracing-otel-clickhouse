@@ -210,7 +210,7 @@ You'll write SQL in one of two places:
 Some labs need the API ports (18081 to 18084) to themselves. Pause and resume
 the background traffic with `./stack.sh traffic off` and `./stack.sh traffic on`.
 
-## The plan (two sessions, about 12.5 hours in total)
+## The plan (two sessions, about 12.75 hours in total)
 
 The course comes in two parts. Part 1 follows a span from the agent to the
 gateway; part 2 follows it into ClickHouse and covers running it in
@@ -229,12 +229,12 @@ mixed review of modules 0 to 6.
 | 5 | [Head and tail sampling](05-sampling.md) | 95 min | Where a keep/drop decision is made and what it costs; a balanced sampling plan; finding a slow dependency without keeping every trace |
 | 6 | [Joining services and environments](06-cross-environment.md) | 45 min | The checklist for one trace across services and environments, and what breaks it |
 
-### Part 2: storing and running it (about 6 hours)
+### Part 2: storing and running it (about 6.25 hours)
 
 | # | Module | Time | You will be able to explain |
 |---|---|---|---|
 | 7 | [ClickHouse storage, replicas and Keeper](07-clickhouse.md) | 45 min | Parts, partitions, the sorting key, replication, what fails and how |
-| 8 | [The data model](08-data-model.md) | 40 min | Every column and table in `schema.sql`, and which summary table answers which question |
+| 8 | [The data model](08-data-model.md) | 60 min | Every column and table in `schema.sql`, which summary table answers which question, and how the schema evolves when apps add attributes |
 | 9 | [Sharding, trace locality and indexes](09-sharding-indexes.md) | 45 min | How a cluster is laid out; why all spans of a trace land on one shard; skip indexes |
 | 10 | [Growing the cluster and copying data](10-copying-data.md) | 60 min | More disk, a new node, a new shard; local and `Distributed` tables; what ClickStack and read-only users see; `remote()` and safe incremental copies |
 | 11 | [Moving older data to S3](11-s3-tiering.md) | 45 min | Disks, storage policies and TTL moves; local S3 with SeaweedFS; real S3 settings |
@@ -263,6 +263,7 @@ open them in advance; each module tells you when.
 | [`labs/otel-gateway-smart-sampling.yaml`](labs/otel-gateway-smart-sampling.yaml) | Module 5: metrics from every span (span metrics, service graph), then per-agent and per-team tail sampling |
 | [`labs/compose.smart-sampling.yaml`](labs/compose.smart-sampling.yaml) | Module 5: restarts the gateway with the smart sampling settings |
 | [`labs/metrics-tables.sql`](labs/metrics-tables.sql) | Module 5: the ClickHouse tables those metrics are written to |
+| [`labs/send-span.sh`](labs/send-span.sh) | Module 8: sends one span through the gateway with attributes the schema has never seen |
 | [`labs/sharding.sql`](labs/sharding.sql) | Module 9: splits data across the two servers instead of copying it, to see where spans land |
 | [`labs/compose.replication.yaml`](labs/compose.replication.yaml), [`labs/macros-03.xml`](labs/macros-03.xml) | Modules 10 and 12: adds a third ClickHouse copy and a separate standalone server |
 | [`labs/compose.replication-s3.yaml`](labs/compose.replication-s3.yaml) | Modules 10 and 12: gives the third copy module 11's S3 storage, once tiering is on |

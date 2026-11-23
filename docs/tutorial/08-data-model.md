@@ -1,4 +1,4 @@
-# Module 8: The data model (40 min)
+# Module 8: The data model (60 min)
 
 ## Why this matters
 
@@ -22,7 +22,9 @@ getting wrong numbers.
   `MATERIALIZED` mean in the DDL.
 - Describe the three summary tables and the materialized views that fill
   them, and read them correctly (`sum`, `-Merge`, `FINAL`).
-- Add a promoted column to the span table, and know what happens to old data.
+- Explain what happens when apps send new resource or span attributes, and
+  evolve the schema (promoted columns, summary tables, sharded tables)
+  without breaking the gateway's inserts.
 
 ## Key terms
 
@@ -483,17 +485,85 @@ as if they were final. Lab step 4 does this.
 > finish them with `quantilesMerge(0.5, 0.95, 0.99)(duration_q)`.
 > </details>
 
-### Changing the schema
+### Schema evolution: new attributes and new columns
+
+Apps add attributes all the time: a team starts sending `org.cost_center`
+on its resource, an SDK upgrade adds a span attribute. Who changes the
+table, and what happens to the spans in the meantime?
+
+**The gateway never changes the table.** The ClickHouse exporter sends the
+same `INSERT` for every batch, naming the 22 stock columns and nothing
+else. With `create_schema: true` it would also run `CREATE TABLE IF NOT
+EXISTS` once at startup, but it never runs `ALTER`. This repo sets
+`create_schema: false`, so the exporter only inserts; the schema is yours.
+(The logs exporter is different: at startup it reads the table's columns
+and adds the optional `EventName` column to its `INSERT` if present. The
+traces exporter in this version has no such check.)
+
+**A new attribute needs no change at all.** Every resource attribute goes
+into `ResourceAttributes` and every span attribute into `SpanAttributes`,
+whatever its key. The exporter turns each value into a string: an int
+`3` becomes `'3'`, a bool `'true'`, a double `'0.75'`, and an array the JSON
+text `'["a","b"]'`. The new key is queryable the moment the span arrives:
+`SpanAttributes['agent.retry_count']`.
+
+The scenarios, and what each needs:
+
+| Change | What you do | What happens |
+|---|---|---|
+| App sends a new resource or span attribute | Nothing | It lands in the map; query it with `ResourceAttributes['key']` or `SpanAttributes['key']` |
+| The new attribute is filtered or grouped on often | `ADD COLUMN ... MATERIALIZED` on the span table, `ON CLUSTER` | New parts store it; old parts compute it on read; `MATERIALIZE COLUMN` stores it everywhere |
+| The attribute is a number or a flag | Promote with `toUInt16OrZero`, `toFloat64OrZero`, `= 'true'` | Typed column; a bad value gives 0, never a failed insert |
+| An attribute is renamed (semantic-convention upgrade, module 3) | Change the column's expression to `if(new != '', new, old)` | Both old and new spans fill the column |
+| A summary table should break down by the new column | Add it to the target table, then `ALTER TABLE <mv> MODIFY QUERY` | New rows have it; rows written earlier stay empty for it |
+| Sharded cluster | Add the column to the local tables **and** to the `Distributed` table | Each is a separate table; see below |
+| Collector upgrade adds stock columns to its `INSERT` | Add them to the table **before** upgrading the gateway | Otherwise every insert fails with "No such column" |
+| Rename or retype a stock column | Don't | Every insert fails (below) |
+
+**How the table takes a new column.**
 
 - `ALTER TABLE ... ON CLUSTER tracing ADD COLUMN ...` goes through the DDL
-  queue in Keeper (module 7) and runs on every server.
+  queue in Keeper (module 7) and runs on every server. It's instant: no part
+  is rewritten, and the gateway keeps inserting with its 22 columns.
+- Columns the `INSERT` doesn't name get filled by the table. A
+  `MATERIALIZED` column is computed from its expression; a `DEFAULT` column
+  takes its default; a plain column with no default gets its type's empty
+  value (`''`, `0`). So adding any of those is safe for the gateway.
 - A new `MATERIALIZED` column is **stored only in parts written after the
   `ALTER`**. For older parts, ClickHouse computes it on read, using the
   column's *current* expression. `MATERIALIZE COLUMN` stores it in old parts
   too; it's a **mutation**, a background job that rewrites existing parts.
-- Never rename or retype stock columns: the exporter would fail to insert.
-  With `create_schema: false`, the exporter never creates or changes tables;
-  this schema is yours to maintain.
+- The materialized views see the new column. They run on the inserted
+  block after the table computes its `MATERIALIZED` columns, so a view's
+  query can use `org_cost_center` the moment the column exists.
+- The expression must not throw. `toUInt16(SpanAttributes['n'])` fails the
+  whole insert (`Code: 6 ... Cannot parse string 'abc' as UInt16`) as soon as
+  one span sends a non-number; `toUInt16OrZero` returns 0 instead. Use the
+  `OrZero` or `OrNull` functions for every promoted number.
+
+**A sharded cluster has two tables to change.** With sharding (module 9),
+the gateway writes to a `Distributed` table and each shard holds a local
+table. `ALTER` on one doesn't change the other. If only the local tables have
+the column, a query through the `Distributed` table fails with `Unknown
+expression identifier`; if only the `Distributed` table has it, the shards
+fail the query because they can't resolve it. Change the local tables
+first, then the `Distributed` table, both `ON CLUSTER`.
+
+**What a breaking change looks like.** If a column in the exporter's
+`INSERT` is missing (renamed, dropped, or not added before a Collector
+upgrade), every batch fails with `code: 16, message: No such column ...`.
+The exporter doesn't treat that as permanent: it logs "Exporting failed.
+Will retry the request after interval." and retries for
+`retry_on_failure.max_elapsed_time` (300 s in this repo), then drops the
+batch. The apps still get HTTP 200 from the gateway, because the gateway
+queues spans before exporting them. Fix the schema inside that window and
+nothing is lost; after it, spans are gone.
+
+**JSON instead of maps.** The exporter has an experimental feature gate,
+`clickhouse.json`, that writes attributes into ClickHouse `JSON` columns
+instead of `Map`. A `JSON` column keeps each path as its own typed
+subcolumn, so numbers stay numbers without promotion. It needs ClickHouse
+25 or newer and a different stock schema; this repo uses the maps.
 
 ## Remember it
 
@@ -556,14 +626,15 @@ as if they were final. Lab step 4 does this.
   number, or should be in the sorting key or an index. Each promoted column
   adds files per part and merge work, so promote dozens, not hundreds.
 
-## Lab (15 min)
+## Lab (35 min)
 
 Run the SQL in the Play UI at <http://localhost:8123/play>, one statement at
 a time. For the longer blocks, you can instead open a client with
 `docker exec -it clickhouse-01 clickhouse-client --password demo
 --multiquery` and paste the whole block. Steps 5 and 6 use tables in a
 scratch `lab` database and drop them at the end; nothing touches the `otel`
-tables except step 7, which removes its column again.
+tables except step 7, which runs in a terminal and removes its columns and
+tables again.
 
 1. **Column kinds.** `system.columns` describes every column;
    `default_kind` is empty for a normal column, or says `MATERIALIZED`,
@@ -736,21 +807,144 @@ tables except step 7, which removes its column again.
    last insert (`ticket-api`) wins; with `IsRoot`, the root wins whatever the
    order.
 
-7. **Add a promoted column, and see what it does with old data.** This adds
-   an `http_method` column, queries it, stores it for old parts, then drops
-   it again:
+7. **Schema evolution, end to end.** This step runs in a terminal at the
+   repo root, because it sends spans through the gateway. Pause the
+   background traffic so only your spans arrive, and define a shortcut:
 
-   ```sql
-   ALTER TABLE otel.otel_traces ON CLUSTER tracing
-     ADD COLUMN http_method LowCardinality(String) MATERIALIZED SpanAttributes['http.request.method'];
-   SELECT http_method, count() FROM otel.otel_traces WHERE http_method != '' GROUP BY 1;
-   ALTER TABLE otel.otel_traces ON CLUSTER tracing MATERIALIZE COLUMN http_method;
-   ALTER TABLE otel.otel_traces ON CLUSTER tracing DROP COLUMN http_method;
+   ```bash
+   ./stack.sh traffic off
+   ch() { docker exec clickhouse-01 clickhouse-client --password demo "$@"; }
    ```
 
-   The `SELECT` already returns values for old spans (computed on read); the
-   `MATERIALIZE COLUMN` mutation then stores them. Try inserting into a
-   materialized column, and you get `Code: 44 ... Cannot insert column`.
+   **a. A new attribute, no DDL.** `labs/send-span.sh` sends one span with a
+   resource attribute and four span attributes the schema has never seen:
+
+   ```bash
+   docs/tutorial/labs/send-span.sh 5c0000000000000000000000000000a1 new-attrs
+   sleep 8
+   ch -q "SELECT ResourceAttributes['org.cost_center'] AS cost_center,
+                 SpanAttributes['agent.retry_count'] AS retry, SpanAttributes['agent.cached'] AS cached,
+                 SpanAttributes['agent.score'] AS score, SpanAttributes['agent.tags'] AS tags
+          FROM otel.otel_traces WHERE TraceId = '5c0000000000000000000000000000a1'"
+   ```
+
+   ```text
+   cost_center  retry  cached  score  tags
+   cc-42        3      true    0.75   ["a","b"]
+   ```
+
+   Every value is a string, and the array is JSON text.
+
+   **b. Promote it while the gateway keeps writing.** Add a `MATERIALIZED`
+   column for each new attribute, a `DEFAULT` column and a plain one, on
+   both replicas:
+
+   ```bash
+   ch -q "ALTER TABLE otel.otel_traces ON CLUSTER tracing
+            ADD COLUMN org_cost_center LowCardinality(String) MATERIALIZED ResourceAttributes['org.cost_center'],
+            ADD COLUMN agent_retry_count UInt16 MATERIALIZED toUInt16OrZero(SpanAttributes['agent.retry_count']),
+            ADD COLUMN ingest_note String DEFAULT 'none',
+            ADD COLUMN plain_col String"
+   ch -q "SELECT hostName() AS host, org_cost_center, agent_retry_count, ingest_note, plain_col
+          FROM clusterAllReplicas(tracing, otel.otel_traces)
+          WHERE TraceId = '5c0000000000000000000000000000a1'"
+   ```
+
+   Both replicas show `cc-42`, `3`, `none` and an empty `plain_col` for the
+   span written *before* the `ALTER`: the values are computed on read. Now
+   send a second span and check that the gateway's unchanged `INSERT`
+   still works:
+
+   ```bash
+   docs/tutorial/labs/send-span.sh 5c0000000000000000000000000000a2 after-alter
+   sleep 8
+   ch -q "SELECT org_cost_center, agent_retry_count, ingest_note FROM otel.otel_traces
+          WHERE TraceId = '5c0000000000000000000000000000a2'"
+   docker logs --since 30s otel-gateway 2>&1 | grep -c 'Exporting failed'
+   ```
+
+   The span is there with all three values, and the gateway logged `0`
+   failures.
+
+   **c. Old parts don't store the column until you materialize it.** Count
+   the parts that have the column on disk, run the mutation, count again:
+
+   ```bash
+   parts() { ch -q "SELECT count() AS parts, countIf(has(cols, 'org_cost_center')) AS storing_it
+                    FROM (SELECT name, groupArray(column) AS cols FROM system.parts_columns
+                          WHERE database = 'otel' AND table = 'otel_traces' AND active GROUP BY name)"; }
+   parts
+   ch -q "ALTER TABLE otel.otel_traces ON CLUSTER tracing MATERIALIZE COLUMN org_cost_center" --format Null
+   sleep 15; parts
+   ```
+
+   In a test run: `6` parts, `1` storing it (the part written after the
+   `ALTER`), then `6` and `6`. Try `INSERT INTO otel.otel_traces
+   (org_cost_center) VALUES ('x')` and you get `Code: 44 ... Cannot insert
+   column`: `MATERIALIZED` columns are filled only by the table.
+
+   **d. A summary table by the new column.** A scratch rollup and its view,
+   then the new dimension added to both:
+
+   ```bash
+   ch -n -q "
+   CREATE TABLE otel.sc_cost ON CLUSTER tracing (minute DateTime, org_owner LowCardinality(String), spans UInt64)
+     ENGINE = ReplicatedSummingMergeTree ORDER BY (org_owner, minute);
+   CREATE MATERIALIZED VIEW otel.sc_cost_mv ON CLUSTER tracing TO otel.sc_cost AS
+     SELECT toStartOfMinute(Timestamp) AS minute, org_owner, count() AS spans
+     FROM otel.otel_traces GROUP BY minute, org_owner;
+   ALTER TABLE otel.sc_cost ON CLUSTER tracing ADD COLUMN org_cost_center LowCardinality(String) AFTER org_owner;
+   ALTER TABLE otel.sc_cost_mv ON CLUSTER tracing MODIFY QUERY
+     SELECT toStartOfMinute(Timestamp) AS minute, org_owner, org_cost_center, count() AS spans
+     FROM otel.otel_traces GROUP BY minute, org_owner, org_cost_center;" --format Null
+   docs/tutorial/labs/send-span.sh 5c0000000000000000000000000000a4 mv-test
+   sleep 8
+   ch -q "SELECT org_owner, org_cost_center, sum(spans) FROM otel.sc_cost GROUP BY ALL"
+   ```
+
+   ```text
+   platform  cc-42  1
+   ```
+
+   Change the target table first, then the view's query; in the other
+   order, the view would select a column its target doesn't have. A view
+   only sees new inserts, so the rollup has no rows from before it existed.
+
+   **e. A breaking change, and the retry window.** Rename a stock column
+   the exporter writes, send a span, read the gateway log, then rename it
+   back:
+
+   ```bash
+   ch -q "ALTER TABLE otel.otel_traces ON CLUSTER tracing RENAME COLUMN TraceState TO TraceState_old" --format Null
+   docs/tutorial/labs/send-span.sh 5c0000000000000000000000000000a3 while-broken
+   sleep 10
+   docker logs --since 15s otel-gateway 2>&1 | grep 'Exporting failed' | grep -o 'code: 16, message: No such column [A-Za-z]*' | head -2
+   ch -q "ALTER TABLE otel.otel_traces ON CLUSTER tracing RENAME COLUMN TraceState_old TO TraceState" --format Null
+   sleep 30
+   ch -q "SELECT count() FROM otel.otel_traces WHERE TraceId = '5c0000000000000000000000000000a3'"
+   ```
+
+   `send-span.sh` still printed HTTP 200: the gateway accepted the span and
+   queued it. The log shows `Exporting failed. Will retry the request after
+   interval.` with `code: 16, message: No such column TraceState`, retried at
+   growing intervals. After the rename back, the count is `1`: the retry
+   delivered it. Had the fix taken longer than 300 s
+   (`retry_on_failure.max_elapsed_time`), the batch would have been dropped.
+
+   **f. Clean up and restart the traffic:**
+
+   ```bash
+   ch -n -q "
+   DROP TABLE IF EXISTS otel.sc_cost_mv ON CLUSTER tracing SYNC;
+   DROP TABLE IF EXISTS otel.sc_cost ON CLUSTER tracing SYNC;
+   ALTER TABLE otel.otel_traces ON CLUSTER tracing
+     DROP COLUMN IF EXISTS org_cost_center, DROP COLUMN IF EXISTS agent_retry_count,
+     DROP COLUMN IF EXISTS ingest_note, DROP COLUMN IF EXISTS plain_col;" --format Null
+   ch -q "SELECT count() FROM system.columns WHERE database = 'otel' AND table = 'otel_traces'"
+   ./stack.sh traffic on
+   ```
+
+   The count is back to `48`.
 
 ## Explain it back
 
@@ -783,6 +977,10 @@ tables except step 7, which removes its column again.
   counts and quantile states; read with `sum` and `-Merge`).
 - A new MATERIALIZED column is computed on read for old parts until
   `MATERIALIZE COLUMN` stores it.
+- The gateway never changes the schema. New attributes land in the maps
+  with no DDL; promoting one is your `ALTER ... ON CLUSTER`. Extra columns
+  are safe for its `INSERT`; a missing stock column fails every batch, which
+  is retried for 300 s and then dropped.
 
 ## Check yourself
 
@@ -829,7 +1027,38 @@ the column existed. `MATERIALIZE COLUMN` starts a mutation that stores it in
 those parts, so reads no longer have to compute it.
 </details>
 
-<details><summary>You run the <code>ADD COLUMN ... ON CLUSTER tracing</code> from lab step 7 while <code>clickhouse-02</code> is stopped. What happens? (Uses module 7.)</summary>
+<details><summary>An app starts sending a new span attribute <code>agent.retry_count</code>. What must change before it's stored?</summary>
+
+Nothing. The exporter writes every span attribute into `SpanAttributes`,
+whatever the key, as a string. It's queryable right away with
+`SpanAttributes['agent.retry_count']`. Promote it to a typed column
+(`toUInt16OrZero(...)`) only if you filter or group on it often.
+</details>
+
+<details><summary>You add <code>org_cost_center</code> as a MATERIALIZED column. Does the gateway need a config change or a restart?</summary>
+
+No. Its `INSERT` names only the 22 stock columns; the table fills every
+other column itself (expression, default, or empty value). The gateway
+never runs `ALTER`, even with `create_schema: true`.
+</details>
+
+<details><summary>Someone renames <code>TraceState</code>. What do the apps and the gateway see?</summary>
+
+The apps still get HTTP 200, because the gateway queues spans before
+exporting. Every export fails with `code: 16 ... No such column
+TraceState` and is retried for `max_elapsed_time` (300 s here). Rename it
+back within that window and the queued spans arrive; after it, they're
+dropped.
+</details>
+
+<details><summary>Why <code>toUInt16OrZero</code> and not <code>toUInt16</code> in a promoted column?</summary>
+
+`toUInt16` throws on a value like `'abc'`, and a throwing expression fails
+the whole insert, so one bad span blocks the batch. `toUInt16OrZero`
+returns 0 instead.
+</details>
+
+<details><summary>You run the <code>ADD COLUMN ... ON CLUSTER tracing</code> from lab step 7b while <code>clickhouse-02</code> is stopped. What happens? (Uses module 7.)</summary>
 
 `clickhouse-01` adds the column, and the statement waits, then reports a
 timeout for `clickhouse-02` after `distributed_ddl_task_timeout` (180 s). The
