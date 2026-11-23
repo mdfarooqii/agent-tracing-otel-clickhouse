@@ -14,6 +14,15 @@ dst() { docker exec -i clickhouse-03 clickhouse-client --password demo "$@"; }
 
 dst -q "CREATE DATABASE IF NOT EXISTS otel"
 
+# A replica needs every storage policy its tables use (module 11's 'tiered').
+for policy in $(src -q "SELECT DISTINCT storage_policy FROM system.tables WHERE database = 'otel' AND storage_policy != ''"); do
+  if [ "$(dst -q "SELECT count() FROM system.storage_policies WHERE policy_name = '$policy'")" = 0 ]; then
+    echo "clickhouse-03 has no storage policy '$policy'. S3 tiering (module 11) is on: restart it with"
+    echo "  docs/tutorial/labs/compose.replication-s3.yaml added (see the comment at the top of that file)."
+    exit 1
+  fi
+done
+
 # Tables first, then the materialized views that write into them.
 tables=$(src -q "SELECT name FROM system.tables WHERE database = 'otel' ORDER BY engine = 'MaterializedView', name")
 for table in $tables; do

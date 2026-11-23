@@ -41,6 +41,41 @@
                 </replica>
             </shard>
         </lab_2shards>
+
+        <!-- Lab only (docs/tutorial/labs/add-shard.sql, module 10): lab_2shards
+             plus clickhouse-03 as a third shard. clickhouse-03 runs only during
+             module 10's lab; until then, queries on this cluster fail.
+             With <secret>, shards run a Distributed query as the user who sent
+             it, so that user's grants and row policies apply on every shard.
+             Without it (the clusters above), shards run it as the <user> listed
+             per replica. A real secret belongs in a file outside the repo. -->
+        <lab_3shards>
+            <secret>lab-interserver-secret</secret>
+            <shard>
+                <replica>
+                    <host>clickhouse-01</host>
+                    <port>9000</port>
+                    <user>default</user>
+                    <password>demo</password>
+                </replica>
+            </shard>
+            <shard>
+                <replica>
+                    <host>clickhouse-02</host>
+                    <port>9000</port>
+                    <user>default</user>
+                    <password>demo</password>
+                </replica>
+            </shard>
+            <shard>
+                <replica>
+                    <host>clickhouse-03</host>
+                    <port>9000</port>
+                    <user>default</user>
+                    <password>demo</password>
+                </replica>
+            </shard>
+        </lab_3shards>
     </remote_servers>
 
     <zookeeper>

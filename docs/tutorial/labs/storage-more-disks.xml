@@ -1,0 +1,30 @@
+<!--
+  Module 10 lab: give a server a second disk without moving any data.
+
+  `disk2` stands in for a newly mounted volume (on a real host: a new EBS
+  volume or SSD, formatted and mounted at /mnt/disk2, owned by clickhouse).
+
+  The policy `grown` keeps the volume name `default` from the built-in
+  `default` policy and adds disk2 to it. ClickHouse only lets a table switch
+  to a policy that contains every volume, and every disk, of its current one.
+-->
+<clickhouse>
+    <storage_configuration>
+        <disks>
+            <disk2>
+                <path>/mnt/disk2/</path>
+                <keep_free_space_bytes>1073741824</keep_free_space_bytes>
+            </disk2>
+        </disks>
+        <policies>
+            <grown>
+                <volumes>
+                    <default>
+                        <disk>default</disk>
+                        <disk>disk2</disk>
+                    </default>
+                </volumes>
+            </grown>
+        </policies>
+    </storage_configuration>
+</clickhouse>

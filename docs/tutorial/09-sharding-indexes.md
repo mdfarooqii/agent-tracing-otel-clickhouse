@@ -309,7 +309,7 @@ modulo the shard count, so going from 2 to 3 shards changes the answer for
 about two thirds of all trace ids, not just a third. Existing rows don't move
 by themselves: they stay where they were written, and a lookup computed with
 the new count asks the wrong shard. To really rebalance you copy almost every
-row again ([module 10](10-copying-data.md) covers the copying tools). So
+row again ([module 10](10-copying-data.md) walks through adding a shard, and covers the copying tools). So
 start with enough shards, or give a new shard a higher weight so that new
 data fills it while old data ages out with the TTL.
 
@@ -736,9 +736,10 @@ new shard so new data fills it while old data expires.
 ## Next
 
 Sharding and replication change where rows live. [Module
-10](10-copying-data.md) answers the practical follow-up: how to add a replica
-and how to copy spans between ClickHouse servers, with or without a shared
-Keeper, without losing late spans.
+10](10-copying-data.md) answers the practical follow-up: how to grow the
+cluster (disks, replicas, shards), which tables readers and tools such as
+ClickStack should use, and how to copy spans between ClickHouse servers, with
+or without a shared Keeper, without losing late spans.
 
 ## Read more
 

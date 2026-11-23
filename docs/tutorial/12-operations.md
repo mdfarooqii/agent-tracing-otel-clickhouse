@@ -1,4 +1,4 @@
-# Module 12: Operational readiness, from gateway to ClickHouse (50 min)
+# Module 12: Operational readiness, from gateway to ClickHouse (80 min)
 
 ## Why this matters
 
@@ -11,7 +11,11 @@ whole pipeline is healthy.
 By the end, you'll be able to name the few signals that matter, read the
 repo's one-screen health check (including its blind spots), rehearse two
 outages and watch the check catch them, and size and run the pipeline like a
-service with its own targets. The full per-component catalogue is in the
+service with its own targets. You'll also know how to run a large ClickHouse
+cluster day to day: when to scale and which way, how to grow disks and change
+S3 tiering without surprises, and what to do when something breaks, using the
+[runbooks appendix](appendix-runbooks.md), several of which you rehearse here.
+The full per-component catalogue of metrics is in the
 [metrics reference appendix](appendix-metrics-reference.md).
 
 ## Key terms
@@ -27,6 +31,9 @@ service with its own targets. The full per-component catalogue is in the
 | **Saturation** | How full a resource is: a queue at 90% of capacity, or a disk with 5% free. One more push and something fails |
 | **Lag** | How far behind something is: here, how many seconds a replica is behind its peer |
 | **Runbook** | A written, step-by-step "what to do when X happens" for the person on call |
+| **Headroom** | How much of a resource is left before it runs out, and how long that lasts at the current growth |
+| **Rolling change** | Restarting or upgrading servers one at a time, so the service never goes down |
+| **Quorum** | The majority of Keeper nodes that must agree for Keeper to work: 2 of 3, or 3 of 5 |
 
 Reminders: the **gateway** is the central OpenTelemetry Collector, and its
 **exporter** writes spans to ClickHouse ([module 4](04-collector.md)). A
@@ -177,11 +184,114 @@ answer. Prometheus, alerting on the rate, answers it for you.
 > under pressure now; if not, it's history.
 > </details>
 
+### Running a large ClickHouse cluster
+
+Everything so far works the same on two servers or forty. What changes at
+scale is that something is always happening somewhere: a disk filling, a
+server being replaced, a schema change rolling out, an upgrade half done.
+Running it well means four habits: **watch headroom**, **change storage
+without moving data**, **keep Keeper boring**, and **change one server at a
+time**. When something does break, the person on call follows a runbook
+instead of improvising.
+
+**1. Watch headroom, and scale before it runs out.** For each resource, know
+the signal, the level at which you act, and the action. These levels are
+starting points; tune them to how fast your data grows and how long the
+action takes:
+
+| Resource | Signal | Plan at | Page at | Usual action |
+|---|---|---|---|---|
+| Local disk | `free_space / total_space` per disk | 40% free | 15% free | Grow the volume; tier old data to S3; then add disks or shards |
+| CPU | Server CPU at the daily peak | 60% | 85% | Bigger servers; more replicas if reads dominate, more shards if inserts do |
+| Memory | Memory vs the server limit | 70% | 90% | Query limits per user; bigger servers |
+| Parts | Max parts in a partition | 300 | 1000 (inserts delayed) | Bigger batches, `async_insert`; check merges |
+| Replication | `absolute_delay`, `queue_size` | 30 s | 300 s | Check fetches, disk, network ([runbook](appendix-runbooks.md#replica-read-only-or-lagging)) |
+| Keeper | Latency, outstanding requests, its disk | Rising trend | `ruok` fails | Faster disks, dedicated hosts, fewer tiny inserts |
+
+Which way to scale is [module 10](10-copying-data.md)'s question "what is
+running out?": disk and server size move nothing and are the first choice;
+a replica adds reads and safety; a shard adds space and insert capacity but
+takes a TTL to balance, so plan it months ahead, at the "plan" level, not
+the "page" level.
+
+**2. Change storage without moving data.** Most storage work is online:
+
+- **Grow a cloud volume in place** (EBS `modify-volume`, then
+  `xfs_growfs`): ClickHouse sees the space without a restart. It can't
+  shrink, and the next change on that volume waits until the current one is
+  `completed`, so grow by enough
+  ([runbook](appendix-runbooks.md#grow-an-ebs-volume-in-place)).
+- **Add a disk** through a new storage policy that contains the old one;
+  new parts spread over both, old parts stay, and the switch is one-way
+  ([runbook](appendix-runbooks.md#add-a-disk-to-a-server), lab in module 10).
+- **Local NVMe** (instance store) is fast but lost when the instance stops:
+  treat every such server as replaceable, with at least two replicas per
+  shard ([runbook](appendix-runbooks.md#servers-with-local-nvme-instance-store)).
+- **Change S3 tiering** (the move age, the bucket, credentials) without
+  rewriting every partition at once: `materialize_ttl_after_modify = 0`,
+  then `MATERIALIZE TTL IN PARTITION`, one day at a time
+  ([runbook](appendix-runbooks.md#change-s3-tiering)).
+- **ClickHouse's own log tables** (`system.text_log`, `query_log`...) have
+  no TTL by default. Give them one, or they quietly become the biggest
+  tables on the disk.
+
+**3. Keep Keeper boring.** Every insert into a replicated table writes to
+Keeper, so Keeper is in the path of every span. Run three nodes (five if
+you must survive two failures), on separate hosts and zones, on fast
+durable disks, not on the busiest ClickHouse servers. Alert on `ruok`, its
+latency and its free disk. Upgrade it separately from ClickHouse. If it
+loses its quorum for good, there's a last-resort recovery mode; rehearse it
+before you need it ([runbook](appendix-runbooks.md#keeper-down-or-quorum-lost)).
+
+**4. Change one server at a time.**
+
+- **Config is code.** `remote_servers`, macros and storage policies come
+  from one source (Ansible, Helm, the ClickHouse operator) and reach every
+  server in one change. Check the result on all of them with
+  `clusterAllReplicas('tracing', system.clusters)` or
+  `system.storage_policies`.
+- **Restarts and upgrades roll**: one replica per shard at a time, checking
+  health between servers, with versions less than a year apart
+  ([runbook](appendix-runbooks.md#rolling-restart-and-upgrade)).
+- **Schema changes** are add-only and `ON CLUSTER`. A server that was down
+  runs them from Keeper's DDL queue when it returns; check
+  `system.distributed_ddl_queue` after each change
+  ([runbook](appendix-runbooks.md#on-cluster-ddl-not-finished)).
+- **Backups** run on a schedule, to storage outside the cluster's own
+  account, and a restore drill proves them monthly
+  ([runbook](appendix-runbooks.md#backup-and-restore-drill)).
+
+**5. When something breaks: the runbooks.** The
+[runbooks appendix](appendix-runbooks.md) has one page per likely problem
+(disk full, too many parts, read-only or lagging replicas, Keeper down, a
+failed node, runaway queries, stuck mutations, the `Distributed` queue,
+the gateway queue), each with symptom, impact, diagnosis, fix, verification
+and prevention. It starts with **the first five minutes**, the same snapshot
+for every alert: is data being lost now, is it one table, one server or
+everything, and what changed. Lab 3 rehearses four of them.
+
+> **Quick check:** A 6-server cluster's disks are at 55% free and drop 2 points a week; CPU at peak is 35%. What do you do, and when?
+>
+> <details><summary>Answer</summary>
+>
+> Nothing urgent: about 7 weeks to the 40% "plan" level. Then grow the volumes in place (or tier more data to S3): disk is the only thing running out. No shard: CPU is fine, and a shard would take a full TTL to balance.
+> </details>
+
+> **Quick check:** One server of a shard dies. While you rebuild it, what must you not do?
+>
+> <details><summary>Answer</summary>
+>
+> Restart, upgrade or stop the shard's remaining replica: it's the only copy. Pause rolling changes until the rebuilt server shows `queue_size = 0` and matching counts.
+> </details>
+
 ## Remember it
 
 > **Fresh, complete, keeping up, usable.** Every alert answers one of those.
 > **The books must balance**: accepted = filtered + sent + queued + failed.
 > And **a total is history; the rate is news**.
+>
+> **At scale: act on headroom, not on outages; grow what moves nothing first;
+> change one server at a time; and follow the runbook, not your memory.**
 
 ## In this repo
 
@@ -194,6 +304,11 @@ answer. Prometheus, alerting on the rate, answers it for you.
   from the whole Docker machine, which all three share. So "memory N% of the
   server limit" is optimistic here. In production, set container limits
   (gateway: about 20% above `limit_mib`).
+- `docs/tutorial/appendix-runbooks.md`: the runbooks. The steps marked
+  "tested" were run on this stack.
+- `docs/tutorial/labs/compose.replication.yaml` and
+  `docs/tutorial/labs/compose.replication-s3.yaml`: the extra server
+  `clickhouse-03` that lab 3 breaks and rebuilds.
 - `docs/tutorial/labs/health-check.sh` (also `./stack.sh health`): one screen
   covering the gateway, Keeper and both ClickHouse nodes. It reads the
   metrics page with `curl`, talks to Keeper on port 9181, and runs SQL on each
@@ -352,8 +467,16 @@ production-ready, work through these:
 - **Change safety**: pin image versions, as `compose.yaml` does; validate the
   Collector config in CI (`otelcol-contrib validate --config=...`); make
   schema changes add-only and `ON CLUSTER`; upgrade one replica at a time.
-- **Runbooks**: Keeper down, replica lost, too many parts, disk full, gateway
-  queue full, S3 errors. Lab 2 rehearses two of them.
+- **Runbooks**: the [runbooks appendix](appendix-runbooks.md), adapted to
+  your hosts and linked from every alert: disk full, growing a volume,
+  adding a disk, S3 tiering changes, too many parts, read-only or lagging
+  replicas, Keeper down, replacing a node, adding a shard, runaway queries,
+  stuck mutations, the `Distributed` queue, `ON CLUSTER` DDL, rolling
+  upgrades, backups, the gateway queue. Each one rehearsed once in staging.
+  Labs 2 and 3 rehearse six of them.
+- **Headroom**: an owner and a "plan at" level for disk, CPU, memory, parts,
+  lag and Keeper (the table in "Running a large ClickHouse cluster"), and
+  dates for the next capacity change.
 
 ## Lab 2 (15 min): rehearse two outages
 
@@ -410,6 +533,138 @@ production-ready, work through these:
 > data) would shorten it, and a gateway restart would lose the queue at once.
 > </details>
 
+## Lab 3 (20 min): rehearse four runbooks
+
+Each step follows a page of the [runbooks appendix](appendix-runbooks.md):
+read the page first, then do it. You need a third ClickHouse server to
+break, the one from module 10. With S3 tiering on (module 11), it needs the
+S3 settings too. This function runs Docker Compose with all four files, so
+it can be reused below:
+
+```bash
+dc() { docker compose -f compose.yaml -f docs/tutorial/labs/compose.s3-tiering.yaml \
+  -f docs/tutorial/labs/compose.replication.yaml -f docs/tutorial/labs/compose.replication-s3.yaml "$@"; }
+dc up -d --no-deps clickhouse-03
+sleep 10; docs/tutorial/labs/add-replica.sh
+```
+
+(Without module 11's S3, use only `compose.yaml` and
+`compose.replication.yaml`, and skip step 4.)
+
+1. **[Replace a failed node](appendix-runbooks.md#replace-a-failed-node).**
+   Destroy `clickhouse-03` with its data, the way a lost instance would,
+   and look at what the other replicas see:
+
+   ```bash
+   dc rm -sfv clickhouse-03
+   docker exec clickhouse-01 clickhouse-client --password demo -q \
+     "SELECT table, total_replicas, active_replicas FROM system.replicas WHERE database = 'otel'"
+   ```
+
+   Every table shows `3  2`: Keeper still lists three replicas, two are
+   active. Now start a new, empty server with the same name, and try to
+   rejoin:
+
+   ```bash
+   dc up -d --no-deps clickhouse-03
+   sleep 10; docs/tutorial/labs/add-replica.sh
+   ```
+
+   It fails: `Replica /clickhouse/tables/<uuid>/01/replicas/clickhouse-03
+   already exists. (REPLICA_ALREADY_EXISTS)`. Keeper still has the dead
+   replica's entry. Remove it from a live server, and try again:
+
+   ```bash
+   docker exec clickhouse-01 clickhouse-client --password demo -q "SYSTEM DROP REPLICA 'clickhouse-03' FROM DATABASE otel"
+   docs/tutorial/labs/add-replica.sh
+   sleep 20
+   docker exec clickhouse-03 clickhouse-client --password demo -q \
+     "SELECT table, total_replicas, active_replicas, queue_size FROM system.replicas WHERE database = 'otel'"
+   for h in clickhouse-01 clickhouse-03; do
+     docker exec $h clickhouse-client --password demo -q "SELECT '$h', count() FROM otel.otel_traces"
+   done
+   ```
+
+   In a test run, all six tables showed `3  3  0` and both servers the same
+   count (134151) 20 seconds later: the new server fetched everything from
+   its peers.
+
+2. **[A runaway query](appendix-runbooks.md#query-using-too-much-memory-or-running-too-long).**
+   Start a query that takes two minutes, find it, and stop it:
+
+   ```bash
+   docker exec clickhouse-01 clickhouse-client --password demo --query_id runaway-1 \
+     -q "SELECT sleepEachRow(1) FROM numbers(120) SETTINGS max_block_size = 1" &
+   sleep 3
+   docker exec clickhouse-01 clickhouse-client --password demo --format PrettyCompactMonoBlock -q \
+     "SELECT query_id, user, round(elapsed) AS secs, formatReadableSize(memory_usage) AS mem FROM system.processes WHERE query_id = 'runaway-1'"
+   docker exec clickhouse-01 clickhouse-client --password demo -q "KILL QUERY WHERE query_id = 'runaway-1' SYNC"
+   ```
+
+   `KILL` reports `finished`, and the background client prints
+   `QUERY_WAS_CANCELLED`. In real life you'd look it up in
+   `system.processes` by `elapsed` or `memory_usage`; `user` says whose it
+   is.
+
+3. **[A stuck mutation](appendix-runbooks.md#stuck-mutation).** An update
+   that fails on half the rows retries forever. Create one on a scratch
+   table, read why it's stuck, and kill it:
+
+   ```bash
+   ch() { docker exec -i clickhouse-01 clickhouse-client --password demo --multiquery --format PrettyCompactMonoBlock; }
+   ch <<'SQL'
+   CREATE DATABASE IF NOT EXISTS drill;
+   CREATE TABLE drill.t (id UInt64, v String) ENGINE = MergeTree ORDER BY id;
+   INSERT INTO drill.t SELECT number, 'x' FROM numbers(1000);
+   ALTER TABLE drill.t UPDATE v = toString(throwIf(id > 500, 'bad row')) WHERE 1;
+   SQL
+   sleep 4
+   ch <<'SQL'
+   SELECT mutation_id, parts_to_do, is_done, latest_fail_error_code_name FROM system.mutations WHERE database = 'drill';
+   KILL MUTATION WHERE database = 'drill';
+   SELECT count() AS open_mutations FROM system.mutations WHERE database = 'drill' AND NOT is_done;
+   SELECT countIf(v = 'x') AS unchanged FROM drill.t;
+   SQL
+   ```
+
+   The mutation shows `parts_to_do 1`, `is_done 0`, and the error
+   `FUNCTION_THROW_IF_VALUE_IS_NON_ZERO`. After `KILL MUTATION`, nothing
+   is open, and all 1000 rows are unchanged: the failed mutation hadn't
+   rewritten anything. (Parts a mutation has already rewritten stay
+   rewritten; there's no rollback.)
+
+4. **[Backup and restore drill](appendix-runbooks.md#backup-and-restore-drill).**
+   Back up `trace_entry` to the local S3 server, restore it into the
+   scratch database, and compare:
+
+   ```bash
+   ch <<'SQL'
+   BACKUP TABLE otel.trace_entry TO S3('http://seaweedfs:8333/traces/backups/lab-1', 'demo', 'demo');
+   RESTORE TABLE otel.trace_entry AS drill.trace_entry FROM S3('http://seaweedfs:8333/traces/backups/lab-1', 'demo', 'demo');
+   SELECT (SELECT count() FROM drill.trace_entry) AS restored, (SELECT count() FROM otel.trace_entry) AS live;
+   SQL
+   ```
+
+   Both statements report their status (`BACKUP_CREATED`, `RESTORED`), and
+   the counts match (10796 in a test run; with traffic running, `live` may
+   be a little higher by the time it's counted). A backup name can be used
+   once: running the same backup again fails with `BACKUP_ALREADY_EXISTS`;
+   use `lab-2`.
+
+5. **Clean up.** The scratch database, then `clickhouse-03`, unregistering
+   it first as in module 10:
+
+   ```bash
+   docker exec clickhouse-01 clickhouse-client --password demo -q "DROP DATABASE drill SYNC"
+   docker exec clickhouse-03 clickhouse-client --password demo -q "DROP DATABASE otel SYNC"
+   dc rm -sfv clickhouse-03
+   ```
+
+   For the next 10 minutes, `./stack.sh health` shows the drills' own errors
+   on `clickhouse-01` (`QUERY_WAS_CANCELLED`,
+   `FUNCTION_THROW_IF_VALUE_IS_NON_ZERO`) in its errors line: a reminder
+   that a WARN needs reading, not just counting.
+
 ### Stretch exercises (optional)
 
 **A. Measure your own capacity numbers.** Bytes per row, then spans per
@@ -454,7 +709,14 @@ the cheapest fix.
 > aren't loss yet. The gateway's books must balance, and for counters I watch
 > the rate. I set SLOs on delivery, freshness and query latency, page on
 > symptoms, keep monitoring outside the pipeline, size disk from spans per
-> second and bytes per span, and rehearse runbooks as game days."
+> second and bytes per span, and rehearse runbooks as game days. On a large
+> ClickHouse cluster I act on headroom (disk, CPU, memory, parts, lag,
+> Keeper) at a 'plan' level, not when it pages. I grow volumes or add disks
+> before adding shards, change S3 tiering one partition at a time, keep
+> Keeper on three dedicated nodes, and change one server at a time. When
+> something breaks, I start with the first five minutes and follow the
+> runbook: for a dead server, drop its replica from Keeper and let a new
+> one fetch everything."
 
 ## Recap
 
@@ -471,6 +733,13 @@ the cheapest fix.
   spans/s x bytes/span x retention x replicas.
 - The exporter fails over between ClickHouse nodes; the queue grows only
   when both are down.
+- At scale: a headroom table with "plan" and "page" levels per resource;
+  online storage changes first (grow the volume, add a disk, tier to S3);
+  Keeper on three dedicated nodes; config as code; one server at a time.
+- The [runbooks appendix](appendix-runbooks.md) covers each likely failure
+  and planned change. Rehearsed here: replacing a node (`SYSTEM DROP
+  REPLICA`, then recreate with the same UUIDs), `KILL QUERY`, `KILL
+  MUTATION`, and a backup restored into a scratch database.
 
 ## Check yourself
 
@@ -520,6 +789,31 @@ isn't rising, the apps can't reach the gateway: look at their logs for
 export errors.
 </details>
 
+<details><summary>A replacement server with the old name fails with <code>REPLICA_ALREADY_EXISTS</code>. What do you run, and where?</summary>
+
+`SYSTEM DROP REPLICA 'clickhouse-03' FROM DATABASE otel`, on a **live**
+server: Keeper still holds the dead replica's entry. Then create the tables
+again with the same UUIDs (`add-replica.sh`), and the new server fetches all
+parts from its peers.
+</details>
+
+<details><summary>You must move spans to S3 after 12 hours instead of 1 day, on a 20 TB table. Why not just run <code>MODIFY TTL</code>?</summary>
+
+By default it rewrites every partition to apply the new rule
+(`materialize_ttl_after_modify = 1`): hours of disk and S3 I/O at once. Set
+it to 0, then `MATERIALIZE TTL IN PARTITION` one day at a time, and repeat
+the delete rule in the new TTL, because `MODIFY TTL` replaces the whole TTL.
+</details>
+
+<details><summary>Disk at 12% free on one server at 3 a.m. What do you try first?</summary>
+
+The cheap and safe things: empty or put a TTL on ClickHouse's own log tables
+(they have none by default), drop detached parts you've checked, move old
+partitions to S3. Then grow the volume, which takes minutes and no restart.
+Dropping partitions comes last: on a replicated table it removes them from
+every replica.
+</details>
+
 ## Next
 
 You've now seen every piece of the pipeline, from the first span to the
@@ -537,6 +831,9 @@ design review questions to test yourself.
 - [ClickHouse Prometheus endpoint](https://clickhouse.com/docs/operations/server-configuration-parameters/settings#prometheus)
 - [`system.metric_log`](https://clickhouse.com/docs/operations/system-tables/metric_log), [`system.query_log`](https://clickhouse.com/docs/operations/system-tables/query_log)
 - [Backup and restore](https://clickhouse.com/docs/operations/backup)
+- [Runbooks appendix](appendix-runbooks.md): every runbook, with its sources
+- [ClickHouse: self-managed upgrade](https://clickhouse.com/docs/operations/update)
+- [ClickHouse Keeper, including recovery after losing quorum](https://clickhouse.com/docs/guides/oss/deployment-and-scaling/keeper)
 - [Prometheus: metric types](https://prometheus.io/docs/concepts/metric_types/)
 - [Google SRE book: service level objectives](https://sre.google/sre-book/service-level-objectives/)
 - [Google SRE workbook: alerting on SLOs](https://sre.google/workbook/alerting-on-slos/)

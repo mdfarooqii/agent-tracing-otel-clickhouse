@@ -172,8 +172,13 @@ the lookup table says when the trace happened, so other days are skipped. At
 larger scale, rows are **sharded** by `cityHash64(TraceId)`, so the whole
 trace still sits on one shard.
 
-**10. A new replica joins, and other servers get copies** ([module 10](10-copying-data.md)).
-A third server that creates the same table with its own `{replica}` name
+**10. The cluster grows, and other servers get copies** ([module 10](10-copying-data.md)).
+Disks grow in place, or a new disk joins through a storage policy that
+contains the old one. A new shard gets new rows only; nothing moves, and the
+shards even out as old data ages out. Readers, ClickStack included, query
+the `Distributed` table (`otel_traces`), never a shard's local table, with
+`readonly = 2` accounts and a cluster `<secret>` so row policies apply on
+every shard. A third server that creates the same table with its own `{replica}` name
 registers in Keeper and fetches every part from its peers. A server with its
 own Keeper pulls rows with `INSERT ... SELECT FROM remote(...)`. To keep
 copying, each run re-reads an **overlapping window** (10 minutes before its
@@ -804,7 +809,7 @@ listed under their first letter, ignoring backticks and symbols.
 | Root span | The span with no parent; the top of the tree. Here `agent_turn` | [1](01-otel-core.md) |
 | RSS | Resident set size: the memory a process actually holds in RAM, such as `otelcol_process_memory_rss_bytes` | [A](appendix-metrics-reference.md) |
 | Run id | The id LangChain gives each step; `parent_run_id` says who called it | [2](02-langgraph.md) |
-| Runbook | A written, step-by-step "what to do when X happens" | [12](12-operations.md) |
+| Runbook | A written, step-by-step "what to do when X happens" | [12](12-operations.md), [B](appendix-runbooks.md) |
 | Runnable | LangChain's common interface (`.invoke(input, config)`) for models, tools, chains and graphs | [2](02-langgraph.md) |
 
 ### S
