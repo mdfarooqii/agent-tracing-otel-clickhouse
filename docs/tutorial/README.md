@@ -264,6 +264,7 @@ open them in advance; each module tells you when.
 | [`labs/compose.smart-sampling.yaml`](labs/compose.smart-sampling.yaml) | Module 5: restarts the gateway with the smart sampling settings |
 | [`labs/metrics-tables.sql`](labs/metrics-tables.sql) | Module 5: the ClickHouse tables those metrics are written to |
 | [`labs/send-span.sh`](labs/send-span.sh) | Module 8: sends one span through the gateway with attributes the schema has never seen |
+| [`labs/rolling-gate.sh`](labs/rolling-gate.sh) | Module 12 and Appendix B: the health gate between servers in a rolling restart or upgrade |
 | [`labs/sharding.sql`](labs/sharding.sql) | Module 9: splits data across the two servers instead of copying it, to see where spans land |
 | [`labs/compose.replication.yaml`](labs/compose.replication.yaml), [`labs/macros-03.xml`](labs/macros-03.xml) | Modules 10 and 12: adds a third ClickHouse copy and a separate standalone server |
 | [`labs/compose.replication-s3.yaml`](labs/compose.replication-s3.yaml) | Modules 10 and 12: gives the third copy module 11's S3 storage, once tiering is on |

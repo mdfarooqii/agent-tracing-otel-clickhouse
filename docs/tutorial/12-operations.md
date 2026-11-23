@@ -252,7 +252,15 @@ before you need it ([runbook](appendix-runbooks.md#keeper-down-or-quorum-lost)).
   `system.storage_policies`.
 - **Restarts and upgrades roll**: one replica per shard at a time, checking
   health between servers, with versions less than a year apart
-  ([runbook](appendix-runbooks.md#rolling-restart-and-upgrade)).
+  ([runbook](appendix-runbooks.md#rolling-restart-and-upgrade)). On a few
+  servers, go one by one. On hundreds, serial takes days, so run **waves
+  by replica**: a canary first, then at most one replica of every shard per
+  batch, all shards together, with an automated gate
+  ([`labs/rolling-gate.sh`](labs/rolling-gate.sh): tables loaded, replicas
+  writable and caught up, no new errors) before the next batch. Batch size
+  is limited by Keeper load and catch-up, not by data size: an upgrade
+  rewrites no parts, but restart time grows with the number of parts
+  ([large clusters](appendix-runbooks.md#large-clusters-hundreds-of-servers-petabytes)).
 - **Schema changes** are add-only and `ON CLUSTER`. A server that was down
   runs them from Keeper's DDL queue when it returns; check
   `system.distributed_ddl_queue` after each change
@@ -282,6 +290,13 @@ everything, and what changed. Lab 3 rehearses four of them.
 > <details><summary>Answer</summary>
 >
 > Restart, upgrade or stop the shard's remaining replica: it's the only copy. Pause rolling changes until the rebuilt server shows `queue_size = 0` and matching counts.
+> </details>
+
+> **Quick check:** 240 servers, 120 shards with two replicas each, 5 PB. A canary restart plus gate takes 25 minutes. Roughly how long does a serial upgrade take, and how do you make it hours?
+>
+> <details><summary>Answer</summary>
+>
+> Serial: 240 x 25 min, about 100 hours, with mixed versions all that time. Instead run two waves, all replica `01` servers then all `02`, in batches sized by Keeper load and catch-up (say 30 servers each: 4 batches of about 25 min per wave, so under 4 hours for both waves). Never two replicas of one shard in a batch, skip shards that are already degraded, and stop on the first failed gate.
 > </details>
 
 ## Remember it
@@ -735,7 +750,9 @@ the cheapest fix.
   when both are down.
 - At scale: a headroom table with "plan" and "page" levels per resource;
   online storage changes first (grow the volume, add a disk, tier to S3);
-  Keeper on three dedicated nodes; config as code; one server at a time.
+  Keeper on three dedicated nodes; config as code; one replica per shard
+  at a time, and on hundreds of servers in waves by replica with a canary
+  and an automated gate between batches.
 - The [runbooks appendix](appendix-runbooks.md) covers each likely failure
   and planned change. Rehearsed here: replacing a node (`SYSTEM DROP
   REPLICA`, then recreate with the same UUIDs), `KILL QUERY`, `KILL

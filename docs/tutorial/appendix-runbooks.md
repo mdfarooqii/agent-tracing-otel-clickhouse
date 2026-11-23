@@ -48,7 +48,7 @@ here.
 | [Stuck mutation](#stuck-mutation) | `stuck mutations` WARN | Medium: blocks later mutations, can starve merges |
 | [Distributed insert queue backlog](#distributed-insert-queue-backlog) | `system.distribution_queue` growing (sharded clusters) | High: local disk fills |
 | [`ON CLUSTER` DDL not finished](#on-cluster-ddl-not-finished) | Code 159 after a schema change | Medium: servers drift |
-| [Rolling restart and upgrade](#rolling-restart-and-upgrade) | Planned | Planned |
+| [Rolling restart and upgrade](#rolling-restart-and-upgrade) | Planned; on large clusters in waves by replica | Planned |
 | [Backup and restore drill](#backup-and-restore-drill) | Monthly drill, or a bad `DELETE` | Planned / critical |
 | [Gateway export queue filling, spans lost](#gateway-export-queue-filling-spans-lost) | Queue over half full, `lost` rising | Critical |
 
@@ -738,19 +738,94 @@ while a server is down for maintenance.
 - Downgrade is possible only to a recent version, and only if no new
   features have been used.
 
+First check whether the change needs a restart at all. The cluster
+definition (`remote_servers`) reloads without one (module 10).
+
 **Per server:**
 
 1. Before: the server is healthy (no read-only tables, `queue_size` near 0,
-   lag under 60 s).
-2. Stop, upgrade (or change config), start.
-3. After: the same checks, plus `SELECT version()`, no new error names in
-   `system.errors`, and the gateway's sent rate unchanged. Then the next
-   server.
+   lag under 60 s), and so are the other replicas of its shard.
+2. Drain: take it out of the query load balancer (or ClickStack's
+   connection) and the gateway's endpoint list, and let running queries
+   finish. Setting `shutdown_wait_unfinished_queries` to `1` in the server
+   config makes a shutdown wait up to `shutdown_wait_unfinished` seconds
+   (default 5) for them.
+3. Stop, upgrade (or change config), start.
+4. Gate: [`labs/rolling-gate.sh`](labs/rolling-gate.sh) waits until the
+   server accepts queries, has loaded every table (`system.asynchronous_loader`),
+   has no read-only replica and lag under 60 s, and has fetched what it
+   missed (`SYSTEM SYNC REPLICA <table> LIGHTWEIGHT`, which waits for the
+   queued fetches but not merges). Then it prints the version and any error
+   names in `system.errors` since the start. Then check the gateway's sent
+   rate is unchanged, put the server back, and go to the next one.
+
+The table-loading check matters because `async_load_databases` is on (it is
+in this repo): the server accepts connections before its tables are
+loaded, so "it answers `SELECT 1`" doesn't mean "it's ready". In a test run
+here, `clickhouse-02` answered after 8 s and the whole gate passed after
+36 s. Its one warning, `DNS_ERROR`, was expected: the `lab_3shards`
+cluster definition names `clickhouse-03`, which wasn't running. Know your
+usual errors, so the gate reports new ones.
 
 In this repo, the version is pinned in `compose.yaml`
 (`clickhouse/clickhouse-server:25.8`); change the tag and recreate one
-server at a time (`docker compose up -d clickhouse-02`, check, then
+server at a time (`docker compose up -d clickhouse-02`, run the gate, then
 `clickhouse-01`).
+
+### Large clusters: hundreds of servers, petabytes
+
+The rules above hold at any size. The per-server loop doesn't, because it
+is serial. An illustration, not a measurement: 5 PB with two replicas at
+about 50 TB per server is about 200 servers; at 20 to 30 minutes each, one
+at a time takes 70 to 100 hours, far from "finish quickly". In-place
+rolling is still the only practical way: an upgrade rewrites no data, while
+building a second cluster means copying petabytes. What changes is how you
+batch, gate and automate it.
+
+- **Waves by replica, not by server.** A shard can lose one replica, so a
+  wave restarts at most one replica of each shard, across all shards
+  together (with `{replica}` macros `01` and `02`: all `01` servers, then
+  all `02`). Two or three replicas means two or three waves, each split into
+  batches. Never put two replicas of one shard in the same batch.
+- **Canary first.** Upgrade one server, run the gate, and time it. That
+  time sets the batch plan. Leave the canary for a while under real queries
+  and inserts before wave 1: a mixed-version problem shows up there, on one
+  server, and downgrading one server is still easy.
+- **Startup time grows with the number of parts, not bytes.** Each server
+  loads the metadata of every part it holds, including parts tiered to S3
+  (their metadata is on local disk). A server with millions of parts can
+  take much longer than this lab's 8 s. Fewer, larger parts (daily
+  partitions, merges keeping up) shorten every restart.
+- **Batch size is set by Keeper and catch-up.** Every restarted server
+  reconnects to Keeper, reloads its replication queues and fetches the
+  parts it missed, while its peer took the inserts. Many at once means
+  Keeper load and network load. Start small, watch Keeper latency and
+  outstanding requests and the restarted servers' lag, and grow the batch
+  while they stay normal. The next batch starts only when every gate in
+  the current one passed.
+- **A wave runs each shard on one copy.** With two replicas, a second
+  failure in a shard during its wave takes that shard down. Before each
+  batch, skip shards with any other problem (a lagging or read-only
+  replica, a server being rebuilt). At petabyte scale, three replicas make
+  waves safer: a batch still leaves two copies.
+- **Automate the loop and stop on the first failure.** A script, Ansible,
+  or the Kubernetes ClickHouse operator: drain, restart, gate, return, for
+  every server in the batch, and stop the rollout when any gate fails
+  (timeout, new errors, lag that doesn't fall, the gateway's sent rate
+  dropping). Someone watches the dashboards; nobody types per-server
+  commands.
+- **Keep the gateway writing.** Each gateway must list more than one
+  endpoint per shard (or sit behind a load balancer), so a batch never
+  leaves it nowhere to write. Inserts into a restarting server fail and
+  the exporter retries another endpoint.
+- **Rollback.** Downgrade only works to a recent version and only before
+  new features are used, so don't use new features, settings or data types
+  until the whole cluster runs the new version and has run it for a while.
+
+**Verify.** `SELECT version(), count() FROM clusterAllReplicas('<cluster>',
+system.one) GROUP BY 1` shows one version; every replica writable with
+`queue_size` near 0; the gateway's sent rate and the query latency SLO as
+before.
 
 ## Backup and restore drill
 
