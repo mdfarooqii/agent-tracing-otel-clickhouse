@@ -210,14 +210,14 @@ You'll write SQL in one of two places:
 Some labs need the API ports (18081 to 18084) to themselves. Pause and resume
 the background traffic with `./stack.sh traffic off` and `./stack.sh traffic on`.
 
-## The plan (two sessions, about 11 hours in total)
+## The plan (two sessions, about 11.5 hours in total)
 
 The course comes in two parts. Part 1 follows a span from the agent to the
 gateway; part 2 follows it into ClickHouse and covers running it in
 production. Each part is a full day, or two half-days. Module 6 ends part 1 with a
 mixed review of modules 0 to 6.
 
-### Part 1: making and shipping spans (about 6 hours)
+### Part 1: making and shipping spans (about 6.5 hours)
 
 | # | Module | Time | You will be able to explain |
 |---|---|---|---|
@@ -226,7 +226,7 @@ mixed review of modules 0 to 6.
 | 2 | [LangChain, LangGraph and callbacks](02-langgraph.md) | 55 min | How a graph run becomes a span tree |
 | 3 | [GenAI semantic conventions](03-genai-semconv.md) | 55 min | Which `gen_ai.*` attributes go on which span; sessions, turns and evals |
 | 4 | [The Collector as a gateway](04-collector.md) | 55 min | Receivers, processors, exporters, buffering, retries, and where data can be lost |
-| 5 | [Head and tail sampling](05-sampling.md) | 65 min | Where a keep/drop decision is made and what it costs |
+| 5 | [Head and tail sampling](05-sampling.md) | 95 min | Where a keep/drop decision is made and what it costs; a balanced sampling plan; finding a slow dependency without keeping every trace |
 | 6 | [Joining services and environments](06-cross-environment.md) | 45 min | The checklist for one trace across services and environments, and what breaks it |
 
 ### Part 2: storing and running it (about 5 hours)
@@ -259,6 +259,9 @@ open them in advance; each module tells you when.
 | [`labs/print_callbacks.py`](labs/print_callbacks.py) | Module 2: prints the raw events LangChain fires while a graph runs |
 | [`labs/otel-gateway-tail-sampling.yaml`](labs/otel-gateway-tail-sampling.yaml) | Module 5: extra gateway settings that keep or drop whole traces after they finish |
 | [`labs/compose.tail-sampling.yaml`](labs/compose.tail-sampling.yaml) | Module 5: restarts the gateway with those extra settings |
+| [`labs/otel-gateway-smart-sampling.yaml`](labs/otel-gateway-smart-sampling.yaml) | Module 5: metrics from every span (span metrics, service graph), then per-agent and per-team tail sampling |
+| [`labs/compose.smart-sampling.yaml`](labs/compose.smart-sampling.yaml) | Module 5: restarts the gateway with the smart sampling settings |
+| [`labs/metrics-tables.sql`](labs/metrics-tables.sql) | Module 5: the ClickHouse tables those metrics are written to |
 | [`labs/sharding.sql`](labs/sharding.sql) | Module 9: splits data across the two servers instead of copying it, to see where spans land |
 | [`labs/compose.replication.yaml`](labs/compose.replication.yaml), [`labs/macros-03.xml`](labs/macros-03.xml) | Module 10: adds a third ClickHouse copy and a separate standalone server |
 | [`labs/add-replica.sh`](labs/add-replica.sh) | Module 10: registers the third copy, which then pulls in all existing data |

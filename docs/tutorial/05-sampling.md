@@ -1,4 +1,4 @@
-# Module 5: Head and tail sampling (65 min)
+# Module 5: Head and tail sampling (95 min)
 
 ## Why this matters
 
@@ -7,7 +7,10 @@ and disk in ClickHouse. **Sampling** means keeping only some traces on purpose.
 The hard part is choosing *which* ones without losing the traces you'll need
 when something breaks. By the end of this module, you'll be able to say where a
 keep-or-drop decision can be made, what each place knows at that moment, what
-it costs, and how to turn each kind on in this repo.
+it costs, and how to turn each kind on in this repo. You'll also build a
+sampling plan that keeps every error, keeps slow turns per agent, lets a team
+keep more of its own traces, and still finds a slow dependency, without
+storing every trace.
 
 ## Key terms
 
@@ -28,6 +31,10 @@ that forwards spans to ClickHouse ([module 4](04-collector.md)).
 | **Policy** | One rule in tail sampling, such as "keep traces with an error" |
 | **Load balancer** | Something that spreads incoming requests across several copies (replicas) of a service |
 | **Adjusted count** | How many real traces one stored trace stands for: 1 divided by the chance it was kept |
+| **Span metrics** | Counts and latency histograms computed from spans as they pass through the gateway, before any are dropped |
+| **Histogram** | A latency summary that counts how many calls fell into each time range ("bucket"), such as 500 ms to 750 ms |
+| **Service graph** | Metrics per caller-to-callee pair ("edge"), such as `support-agent` calling `kb-search-api`: calls, failures and latency |
+| **Exemplar** | A trace id attached to a metric, as an example of one call it counted |
 
 ## Idea
 
@@ -180,7 +187,8 @@ The `tail_sampling` processor works like this:
    processor (`batch`) and then to ClickHouse. Dropped traces are discarded.
 
 That's simplified: policies can also be combined with `and` and `composite`,
-and some can drop traces explicitly. This repo only uses "keep if any matches".
+and some can drop traces explicitly. This lab file only uses "keep if any
+matches"; the smart sampling lab later in this module also uses `and`.
 
 Here is the lab file `docs/tutorial/labs/otel-gateway-tail-sampling.yaml`,
 block by block.
@@ -319,7 +327,7 @@ counted), errors, and duration (latency). Two ways to keep them right:
   from `otlp`, and each gets every span. The first exports to the
   `spanmetrics` connector, which turns every span into RED metrics and feeds
   them to a metrics pipeline. The second runs `tail_sampling` and writes the
-  kept traces to ClickHouse. (Not in this repo.)
+  kept traces to ClickHouse. (The smart sampling lab below sets this up.)
 - Or weight each stored trace by its **adjusted count**: 1 divided by the
   probability it was kept. A trace kept at 10% counts as 10; an error trace
   kept at 100% counts as 1. This needs the probability stored with the trace.
@@ -346,6 +354,225 @@ undercount if you turned sampling on permanently.
 > count 10 (kept at 10%). Slow traces, also kept at 100%, would count as 1 each.
 > </details>
 
+### Smarter sampling: a plan in layers
+
+The lab policies above use one rule for everyone. Real teams ask for more:
+"keep more of my service's traces", "keep every error", "tell me when agents
+get slower, and why". One plan can answer all three, in layers:
+
+```text
+1. Measure everything     metrics from 100% of spans, before any are dropped
+2. Always keep            every error; every turn slower than its agent's normal
+3. Keep more on request   a team's higher rate, or a flag on chosen requests
+4. Keep a baseline        a small random share of everything else (here 5%)
+   (optional) Cap it      a spans-per-second budget across the policies
+```
+
+Back to the TV network: the **scoreboard** records the score and length of
+every match, filmed or not (layer 1). The editor keeps every upset and every
+match that ran unusually long *for that league* (layer 2). A club that pays
+for extra coverage gets more of its matches kept (layer 3). And a few ordinary
+matches are kept, so there's something to compare against (layer 4).
+
+#### Layer 2: one "slow" line per agent
+
+The `latency` policy measures the whole trace, from the earliest span's start
+to the latest span's end; here, one agent turn. But "slow" depends on the
+agent. A test run of 10 turns per agent in this repo measured:
+
+| Agent | Median turn | 90th percentile |
+|---|---|---|
+| `hr-agent` | 738 ms | 831 ms |
+| `sales-agent` | 908 ms | 1031 ms |
+| `support-agent` | 1483 ms | 1719 ms |
+
+With one 1500 ms line for everyone, about half of the support agent's
+*normal* turns count as "slow" and are all kept. Meanwhile the HR agent could
+nearly double, from 0.74 s to 1.4 s, without a single turn crossing the line.
+So give each agent its own line, at about 1.3 times its normal 90th
+percentile, by combining two policies with `and`: "this agent" and "slower
+than X".
+
+```yaml
+- name: slow-support-agent
+  type: and
+  and:
+    and_sub_policy:
+      - { name: is-support-agent, type: string_attribute, string_attribute: { key: service.name, values: [support-agent] } }
+      - { name: over-2200ms, type: latency, latency: { threshold_ms: 2200 } }
+```
+
+`string_attribute` matches if *any* span in the trace has that value, in its
+own attributes or its resource's. Here that's the agent's spans, whose
+resource has `service.name = support-agent`.
+
+The thresholds are fixed numbers: the processor can't compute "slower than
+this agent's 90th percentile" by itself. Recompute them from the metrics
+(lab step 4 shows the query) when an agent changes, for example a new model or
+a new tool, and keep one high catch-all line (5 s here) for agents that don't
+have their own.
+
+#### Layer 3: letting a team keep more of its traces
+
+Say the `ticket-api` team wants to keep half of the traces that involve their
+service, not 5%. There are two places to do it, and only one works well:
+
+- **In the team's own SDK** (head sampling), with
+  `OTEL_TRACES_SAMPLER_ARG=0.5`. With parent-based sampling, that rate only
+  applies to traces that **start** in `ticket-api`. When an agent calls the
+  API, the agent's decision wins, and the 50% does nothing. Switching off
+  parent-based to force it creates orphans (lab step 2).
+- **At the gateway** (tail sampling), with "touches `ticket-api`" `and`
+  "50%":
+
+  ```yaml
+  - name: ticket-api-50-percent
+    type: and
+    and:
+      and_sub_policy:
+        - { name: touches-ticket-api, type: string_attribute, string_attribute: { key: service.name, values: [ticket-api] } }
+        - { name: half, type: probabilistic, probabilistic: { sampling_percentage: 50 } }
+  ```
+
+What it costs:
+
+- **The whole trace is kept**, not just the team's spans: the calling agent's
+  spans and every other service in those traces are stored too. In this repo,
+  every HR turn calls `ticket-api`, so this one policy stores half of all HR
+  turns.
+- **Storage grows with the traffic that touches the service.** Extra spans
+  stored per second is about: traces per second that touch the service x
+  (new rate - baseline rate) x spans per trace. For example, 100 traces a
+  second, 50% instead of 5%, 20 spans each: 100 x 0.45 x 20 = 900 extra spans
+  a second, about 78 million a day.
+- **Gateway memory doesn't change.** The tail sampler already holds every
+  trace while it decides. The extra cost is in ClickHouse: more inserts, more
+  disk.
+- **Stored counts get skewed.** That service is now over-represented among
+  stored traces, so count from metrics (layer 1), not from stored traces.
+
+Two ways to keep this under control:
+
+- **Cap the total.** A `composite` policy gives each sub-policy a share of a
+  spans-per-second budget, so one team turning their rate up can't flood
+  ClickHouse. Sub-policies are checked in `policy_order`, and the first one
+  that matches decides. If that one has already used its share in the
+  current second, the trace is dropped, even if a later sub-policy still has
+  room; so give errors the biggest share. It's a hard cap only if every
+  policy sits inside the composite, because any policy outside it can still
+  keep the trace. The budget applies per gateway instance, so divide your
+  total by the number of gateways.
+
+  ```yaml
+  - name: budgeted
+    type: composite
+    composite:
+      max_total_spans_per_second: 20000
+      policy_order: [errors, slow, baseline]
+      composite_sub_policy:
+        - { name: errors, type: status_code, status_code: { status_codes: [ERROR] } }
+        - { name: slow, type: latency, latency: { threshold_ms: 5000 } }
+        - { name: baseline, type: probabilistic, probabilistic: { sampling_percentage: 5 } }
+      rate_allocation:
+        - { policy: errors, percent: 50 }
+        - { policy: slow, percent: 30 }
+        - { policy: baseline, percent: 20 }
+  ```
+
+  (This snippet starts on the gateway version this repo uses, but the lab
+  doesn't run it.)
+- **Keep more of chosen requests only.** Instead of a permanent rate, the app
+  sets an attribute such as `org.sampling.force = true` on a canary release, a
+  tenant under investigation, or a debug session, and a `boolean_attribute`
+  policy keeps those traces. `org.sampling.force` is a name you'd choose; it's
+  not a standard attribute, and the agents in this repo don't set it.
+
+#### Head sampling plus every error
+
+Head sampling decides before anything has failed, so on its own it can't keep
+every error. The standard way to get "a small sample plus every error" is:
+
+1. Every SDK sends everything (the default, `parentbased_always_on`).
+2. The gateway tail-samples: every error, every slow turn, plus a small
+   random share. That random share *is* the "head bucket": the `probabilistic`
+   policy decides from the trace id, so every gateway agrees.
+
+The cost is sending and holding 100% of spans; storage is only for what's
+kept. If one very busy, low-value service can't afford to send everything,
+head-sample just that service (say 20%) and tail-sample the rest. Accept that
+only errors in its 20% are kept, and that the gateway's metrics see only that
+20% too: for exact counts, that service needs metrics computed inside the app.
+
+#### Finding latency problems without keeping every trace
+
+Split the job into three questions, each answered by a different tool:
+
+| Question | Answered by | Based on |
+|---|---|---|
+| Is something getting slower? Which agent, span or model? | Span metrics | Every span |
+| Which dependency is slow? | Service graph | Every call between services |
+| Why: which step of the turn grew? | Slow stored traces compared with baseline ones | Kept traces |
+
+```mermaid
+flowchart LR
+  R[otlp receiver] --> A["traces/all:<br/>no sampling"]
+  R --> S["traces:<br/>tail_sampling, batch"]
+  A --> SM[spanmetrics] --> M["metrics pipeline"]
+  A --> SG[servicegraph] --> M
+  M --> CH[(ClickHouse)]
+  S --> CH
+```
+
+- **Span metrics** (`spanmetrics` connector): for every service, span name,
+  span kind and status, a call count and a latency **histogram**, here also
+  split by `gen_ai.operation.name`, `gen_ai.request.model` and
+  `gen_ai.tool.name`. It sees every span, so a 95th percentile computed from
+  it is right whatever you sample. A percentile from a histogram is only as
+  precise as its buckets: you learn "95% of turns took at most 2 s", not
+  "1,873 ms". Choose buckets around your normal latencies.
+- **Service graph** (`servicegraph` connector): it pairs each client span
+  (the caller's "I called X") with the server span it reached (X's "I was
+  called"), and records calls, failures and latency per edge:
+  `support-agent -> kb-search-api`, `ticket-api -> postgresql`. A call that
+  never reaches an instrumented service, like a database or an LLM provider,
+  still becomes an edge to a **virtual node**, named from an attribute of the
+  client span (`db.system.name`, `gen_ai.provider.name`). If none is set, the
+  node is called `unknown`. In this repo, that's `legacy-hr-api`: the gateway
+  drops its spans (module 4), so the HR agent's calls to it never meet a
+  server span.
+- **Slow traces compared with baseline traces**: layer 2 keeps the slow
+  turns, layer 4 keeps some normal ones. Average each span name's duration in
+  both groups. Every span *above* the cause gets slower too, since parents
+  include their children's time; the cause is the **deepest** span that
+  gained the time.
+- **Exemplars** link the two worlds: each histogram stores a few trace ids
+  as examples. An example from a normal minute probably points at a dropped
+  trace. An example from a slow bucket probably points at a kept one, because
+  the slow-turn policy kept it. In a test run, 1 of 14 exemplars from a run
+  of normal turns pointed at a stored trace, and 15 of 17 during a slowdown.
+
+To notice a slowdown **before** users complain, watch trends rather than
+single minutes. Compare each agent's 95th percentile with the same hour last
+week, and watch the causes that usually come first: more LLM or tool calls
+per turn (span metrics counts both), a new model name appearing (it's a
+dimension), or a dependency edge getting slower. Growing prompt sizes are
+another early sign. Span metrics don't sum token attributes, so that needs
+in-app metrics, such as the GenAI convention's `gen_ai.client.token.usage`
+histogram ([module 3](03-genai-semconv.md)), or queries on stored traces.
+
+> **Quick check:** The support agent's 95th percentile jumps from 2 s to 3 s.
+> The service graph shows `support-agent -> kb-search-api` went from 150 ms to
+> 1,150 ms, and every other edge is flat. In the slow stored traces, the
+> `invoke_agent researcher` span is 1 s slower than usual. Is the researcher
+> agent the problem?
+>
+> <details><summary>Answer</summary>
+>
+> No. The researcher span includes its children's time, and its child, the
+> `kb-search-api` call, gained the same second. The deepest span with the extra
+> time, `GET /v1/search` in `kb-search-api`, is the cause.
+> </details>
+
 ## Remember it
 
 > **Head sampling picks which matches to film before kickoff: cheap, but blind
@@ -365,6 +592,13 @@ traces whole.
 - **Tail sampling**: `docs/tutorial/labs/otel-gateway-tail-sampling.yaml`,
   merged into the gateway by `docs/tutorial/labs/compose.tail-sampling.yaml`.
   It's off unless you start the gateway with that compose file.
+- **Smart sampling**: `docs/tutorial/labs/otel-gateway-smart-sampling.yaml`
+  (span metrics, service graph, per-agent slow lines, the `ticket-api` opt-in,
+  a 5% baseline), merged by `docs/tutorial/labs/compose.smart-sampling.yaml`.
+  Its metrics go to `otel.otel_metrics_sum` and `otel.otel_metrics_histogram`,
+  created by `docs/tutorial/labs/metrics-tables.sql`.
+- **A slow dependency on demand**: `SLOW_SERVICE=<api> SLOW_MS=<ms>` makes
+  one of the APIs in `agent/apis.py` that much slower.
 
 ## Principal engineer's notes
 
@@ -391,6 +625,15 @@ traces whole.
   moves some trace ids to a different instance. Traces in flight at that
   moment are split and decided twice, so you get fragments for about one
   `decision_wait`. Scale tier 2 in quiet periods, not in the middle of an incident.
+- The service graph has the same "one trace, one instance" need: it pairs a
+  client span with its server span in one instance's memory (`store`, up to
+  `max_items` waiting for `ttl`). With several gateways, run it in tier 2,
+  behind trace-id routing.
+- Span metrics cost grows with **series**: every distinct combination of
+  service, span name, kind, status and dimension values is its own row every
+  flush. Model and tool names are fine; a request id or a user id as a
+  dimension would create a series per request. `aggregation_cardinality_limit`
+  caps it.
 
 **Operational issues**
 - Watch for traces evicted before a decision
@@ -404,14 +647,19 @@ traces whole.
 **Design trade-offs**
 - This repo stores everything by default and computes RED metrics with a
   materialized view on stored spans. With permanent sampling, move RED to
-  before sampling (`spanmetrics`) so dashboards stay exact.
+  before sampling (`spanmetrics`, as the smart sampling lab does) so
+  dashboards stay exact.
+- Per-team rates are a cost decision for everyone in the trace, so keep them
+  in the gateway config and change them by review, with a `composite` budget
+  as the ceiling. Prefer a flag on chosen requests over a permanent higher
+  rate when the need is temporary.
 - **Consistent probability sampling** is the standard way to keep counts
   correct: each sampler writes the probability it used into the `tracestate`
   header, so every stage agrees and any backend can compute the adjusted
   count. Choose it when several stages sample, or when you need weighted
   counts from stored traces.
 
-## Lab (25 min)
+## Lab (50 min)
 
 Each experiment sets `OTEL_RESOURCE_ATTRIBUTES=lab.run=...`. The SDK adds that
 label to the resource of every span, so you can find exactly that experiment's
@@ -540,13 +788,185 @@ Run SQL in <http://localhost:8123/play> (user `default`, password `demo`).
    ./stack.sh traffic off && ./stack.sh traffic on
    ```
 
+4. **Smart sampling, and finding a slow dependency (25 min).** Create the
+   two metrics tables, restart only the gateway with the smart sampling config,
+   and run traffic every 10 seconds:
+
+   ```bash
+   docker exec -i clickhouse-01 clickhouse-client --password demo --multiquery < docs/tutorial/labs/metrics-tables.sql
+   docker compose -f compose.yaml -f docs/tutorial/labs/compose.smart-sampling.yaml up -d --no-deps otel-gateway
+   ./stack.sh traffic off && TRAFFIC_INTERVAL=10 ./stack.sh traffic on
+   ```
+
+   The first command prints one line per server for each table; that's
+   `ON CLUSTER` reporting success. `--no-deps` restarts only the gateway and
+   leaves ClickHouse alone.
+
+   **a. What was stored, compared with what really ran.** Wait 3 minutes. The
+   first half of this query counts real turns from span metrics; the second
+   counts stored turns:
+
+   ```sql
+   SELECT agent, real_turns, stored_turns
+   FROM (SELECT ServiceName AS agent, sum(Value) AS real_turns FROM otel.otel_metrics_sum
+         WHERE MetricName = 'traces.span.metrics.calls' AND Attributes['span.name'] = 'agent_turn'
+           AND TimeUnix > now() - INTERVAL 3 MINUTE GROUP BY agent) AS m
+   LEFT JOIN (SELECT ServiceName AS agent, count() AS stored_turns FROM otel.otel_traces
+              WHERE SpanName = 'agent_turn' AND Timestamp > now() - INTERVAL 3 MINUTE GROUP BY agent) AS s
+   USING agent ORDER BY agent;
+   ```
+
+   The two halves don't line up exactly at the edges of the window (metrics
+   arrive every 15 seconds, sampling decisions 10 seconds after a turn), so
+   treat the numbers as approximate. Over a longer test run, the shares
+   stored were about:
+
+   | Agent | Stored | Kept by |
+   |---|---|---|
+   | `hr-agent` | 51% | `ticket-api-50-percent`: every HR turn files a ticket |
+   | `sales-agent` | 51% | `keep-errors`: `pricing-api` fails 30% of calls, and a turn makes several |
+   | `support-agent` | 37% | `keep-errors` for the deliberate failed turn in each round, plus the 5% baseline |
+
+   That's 46% overall, and only because this demo fails on purpose so often.
+   With a real error rate of 1 or 2%, the same policies would store a much
+   smaller share. Note that HR's half is the cost of one team's opt-in.
+
+   **b. Make a dependency slower.** Restart the traffic with `kb-search-api`
+   adding 1 second to every request:
+
+   ```bash
+   ./stack.sh traffic off && SLOW_SERVICE=kb-search-api SLOW_MS=1000 TRAFFIC_INTERVAL=10 ./stack.sh traffic on
+   ```
+
+   Wait 3 minutes, then ask the three questions in order.
+
+   **c. Is something slower, and which agent?** This turns each minute's
+   histogram buckets into a 95th percentile. `sumForEach` adds up the bucket
+   counts of the rows in that minute, and `arrayCumSum` makes them a running
+   total. The first bucket where the running total reaches 95% of the turns
+   holds the 95th percentile, and its upper bound (from `ExplicitBounds`) is
+   the answer:
+
+   ```sql
+   SELECT minute, agent, turns, if(i > length(bounds), inf, bounds[i]) AS p95_at_most_ms
+   FROM (SELECT toStartOfMinute(TimeUnix) AS minute, ServiceName AS agent, sum(Count) AS turns,
+                any(ExplicitBounds) AS bounds,
+                arrayFirstIndex(c -> c >= 0.95 * turns, arrayCumSum(sumForEach(BucketCounts))) AS i
+         FROM otel.otel_metrics_histogram
+         WHERE MetricName = 'traces.span.metrics.duration' AND Attributes['span.name'] = 'agent_turn'
+           AND TimeUnix > now() - INTERVAL 8 MINUTE
+         GROUP BY minute, agent)
+   ORDER BY agent, minute;
+   ```
+
+   (`inf` means the last bucket: slower than the highest bound, 10 s.) In a
+   test run, `support-agent` went from "at most 2000 ms" to "at most 3000 ms"
+   in the minute the slowdown started and stayed there, while `hr-agent` stayed
+   at 1000 ms and `sales-agent` moved between 1000 and 1500 ms, as before.
+
+   To set the per-agent slow lines from layer 2, run the same query over a
+   normal hour with `0.9` instead of `0.95`, and without `minute`.
+
+   **d. Which dependency?** Average latency per service-graph edge, in the
+   last 3 minutes against the 3 minutes before. The `client` metric is the
+   latency the caller saw:
+
+   ```sql
+   SELECT Attributes['client'] AS client, Attributes['server'] AS server,
+          round(1000 * sumIf(Sum, TimeUnix <= now() - INTERVAL 3 MINUTE) / sumIf(Count, TimeUnix <= now() - INTERVAL 3 MINUTE)) AS before_ms,
+          round(1000 * sumIf(Sum, TimeUnix > now() - INTERVAL 3 MINUTE) / sumIf(Count, TimeUnix > now() - INTERVAL 3 MINUTE)) AS last_3_min_ms
+   FROM otel.otel_metrics_histogram
+   WHERE MetricName = 'traces_service_graph_request_client' AND TimeUnix > now() - INTERVAL 6 MINUTE
+   GROUP BY client, server ORDER BY last_3_min_ms - before_ms DESC;
+   ```
+
+   The service graph records latency in seconds, hence `1000 *`. A test run:
+
+   ```text
+   client          server          before_ms   last_3_min_ms
+   support-agent   kb-search-api         272            1165
+   hr-agent        unknown               352             371
+   support-agent   fakechatmodel         232             241
+   sales-agent     pricing-api            88              84
+   hr-agent        ticket-api             62              58
+   ...every other edge also flat
+   ```
+
+   One edge moved, by about the second you added. (Its "before" is above the
+   ~150 ms of a clean run, because the 3 minutes before also caught the first
+   slow requests.) `fakechatmodel` is the LLM provider and `postgresql` the
+   ticket database: virtual nodes. `unknown` is `legacy-hr-api`, whose spans
+   the gateway drops.
+
+   **e. Why: which span grew?** Compare the support agent's stored slow turns
+   with its stored normal ones, leaving out error turns, which end early:
+
+   ```sql
+   WITH turns AS (
+     SELECT TraceId, Duration / 1e6 > 2200 AS slow FROM otel.otel_traces
+     WHERE ServiceName = 'support-agent' AND SpanName = 'agent_turn' AND Timestamp > now() - INTERVAL 8 MINUTE
+       AND TraceId NOT IN (SELECT TraceId FROM otel.otel_traces WHERE StatusCode = 'Error' AND Timestamp > now() - INTERVAL 8 MINUTE))
+   SELECT s.ServiceName, s.SpanName, countIf(t.slow) AS slow_spans, countIf(NOT t.slow) AS normal_spans,
+          round(avgIf(s.Duration / 1e6, t.slow)) AS slow_ms, round(avgIf(s.Duration / 1e6, NOT t.slow)) AS normal_ms,
+          slow_ms - normal_ms AS extra_ms
+   FROM otel.otel_traces AS s INNER JOIN turns AS t ON s.TraceId = t.TraceId
+   WHERE s.SpanName != 'agent_turn'
+   GROUP BY s.ServiceName, s.SpanName ORDER BY extra_ms DESC LIMIT 6;
+   ```
+
+   A test run (23 slow turns, 5 normal ones from the baseline):
+
+   ```text
+   ServiceName     SpanName                             slow_ms   normal_ms   extra_ms
+   support-agent   invoke_workflow support_supervisor      2570        1459       1111
+   support-agent   invoke_agent researcher                 1584         588        996
+   kb-search-api   GET /v1/search                          1167         199        968
+   support-agent   GET /v1/search                          1175         219        956
+   support-agent   execute_tool search_knowledge_base      1175         219        956
+   support-agent   chat fake-writer                         585         456        129
+   ```
+
+   Read it from the bottom of the tree up. The workflow, the researcher agent,
+   the tool and the HTTP client call all gained about a second, but each only
+   because its child did. The deepest span with the extra second is
+   `kb-search-api`'s own server span, `GET /v1/search`: the time is spent
+   inside that API. The LLM calls barely changed. With only 5 normal turns,
+   small differences like the writer's 129 ms are noise.
+
+   **f. Do the exemplars lead somewhere?** For the support agent's turn
+   histogram, count the exemplar trace ids that were stored:
+
+   ```sql
+   SELECT TimeUnix > now() - INTERVAL 3 MINUTE AS during_slowdown, count() AS exemplars,
+          countIf(trace_id IN (SELECT TraceId FROM otel.otel_traces)) AS stored
+   FROM otel.otel_metrics_histogram ARRAY JOIN Exemplars.TraceId AS trace_id
+   WHERE MetricName = 'traces.span.metrics.duration' AND ServiceName = 'support-agent'
+     AND Attributes['span.name'] = 'agent_turn' AND TimeUnix > now() - INTERVAL 6 MINUTE
+   GROUP BY during_slowdown;
+   ```
+
+   In a test run, 30 of 31 exemplars during the slowdown led to a stored
+   trace, because the slow-turn policy kept those turns. Before it, 20 of 38
+   did, mostly the error turns, which are always kept.
+
+   Put everything back: normal traffic, and the gateway without sampling. The
+   metrics tables can stay; nothing writes to them without the lab config.
+
+   ```bash
+   ./stack.sh traffic off && ./stack.sh traffic on
+   docker compose up -d --no-deps otel-gateway
+   ```
+
 ## Explain it back
 
 > "Head sampling decides in the SDK when the root span starts: free, but blind
 > to failures. Children follow the `traceparent` flag, so traces stay whole.
 > Tail sampling decides in the Collector after the whole trace arrives, so it
 > keeps all errors and slow traces; it costs memory, and needs every span of a
-> trace on one instance. Compute metrics before sampling, or weight them."
+> trace on one instance. Compute metrics before sampling, or weight them.
+> For a balanced plan: measure everything, keep every error and every turn
+> slower than its agent's normal, keep more on request, and keep a small
+> baseline to compare against."
 
 ## Recap
 
@@ -562,6 +982,16 @@ Run SQL in <http://localhost:8123/play> (user `default`, password `demo`).
   the rest, after a 10-second wait.
 - With several gateways, tail sampling needs a first tier that routes by trace
   id. And after any sampling, raw `count()` no longer equals real traffic.
+- A balanced plan has layers: metrics from every span, keep every error and
+  every turn slower than *its agent's* normal, keep more on request, and a
+  small baseline. "Head sampling plus every error" is really this: send
+  everything, decide at the gateway.
+- A team's higher rate belongs at the gateway (`and` of "touches my service"
+  and a percentage). It keeps whole traces, so it costs storage for every
+  service in them; cap it with a `composite` budget.
+- Latency problems are found in three steps: span metrics say what got slower,
+  the service graph says which dependency, and slow stored traces compared
+  with baseline ones say which span.
 
 ## Check yourself
 
@@ -604,6 +1034,30 @@ are over-represented in what's stored. Compute error rates before sampling
 (for example with the `spanmetrics` connector), or weight the counts.
 </details>
 
+<details><summary>The <code>ticket-api</code> team sets <code>OTEL_TRACES_SAMPLER=parentbased_traceidratio</code> with <code>OTEL_TRACES_SAMPLER_ARG=0.5</code> in their service, but nothing changes. Why, and what should they do instead?</summary>
+
+`ticket-api` is always called by an agent, so its spans are never roots: the
+parent-based sampler follows the agent's decision and the ratio is never used.
+Add a gateway policy instead: `and` of "a span with `service.name =
+ticket-api`" and `probabilistic` 50%.
+</details>
+
+<details><summary>Every turn of one agent normally takes 3 s; the others take under 1 s. What goes wrong with a single <code>latency</code> policy at 1.5 s?</summary>
+
+Every normal turn of the slow agent is "slow", so all of them are kept, which
+costs storage and buries real slowdowns. And a fast agent could double without
+crossing 1.5 s. Use one `and` policy per agent, with a line at about 1.3 times
+its normal 90th percentile.
+</details>
+
+<details><summary>The support agent got slower. Span metrics show it, but how do you tell whether the cause is its LLM, its tool code or an API it calls, without storing every trace?</summary>
+
+Look at the service graph: the edge whose latency grew points at the
+dependency (the LLM provider and databases appear as virtual nodes). Then
+compare the stored slow turns with stored baseline turns: the deepest span
+that gained the time is the cause.
+</details>
+
 <details><summary>Why does the tail sampling lab file repeat the whole processor list, instead of just adding <code>tail_sampling</code>?</summary>
 
 When the Collector merges config files, lists are replaced, not appended. The
@@ -627,3 +1081,4 @@ breaks that.
 - [Load-balancing exporter](https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/main/exporter/loadbalancingexporter/README.md)
 - [Probabilistic sampler processor](https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/main/processor/probabilisticsamplerprocessor/README.md)
 - [Span metrics connector](https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/main/connector/spanmetricsconnector/README.md)
+- [Service graph connector](https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/main/connector/servicegraphconnector/README.md)

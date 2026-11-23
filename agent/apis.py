@@ -11,6 +11,9 @@ and ClickHouse treat each case:
     legacy-hr-api   org.owner and org.service on the span instead of the resource; the gateway drops it
 
 The entry-span labels arrive as W3C baggage from the calling agent.
+
+SLOW_SERVICE=<name> SLOW_MS=<ms> adds that much latency to every request the
+named service handles, to simulate a dependency getting slower.
 """
 
 from __future__ import annotations
@@ -139,7 +142,7 @@ SERVICES = {
 }
 
 
-def make_handler(service: Service) -> type[BaseHTTPRequestHandler]:
+def make_handler(service: Service, extra_delay_s: float = 0.0) -> type[BaseHTTPRequestHandler]:
     tracer = get_tracer()
 
     class Handler(BaseHTTPRequestHandler):
@@ -178,6 +181,7 @@ def make_handler(service: Service) -> type[BaseHTTPRequestHandler]:
             ) as span:
                 length = int(self.headers.get("Content-Length") or 0)
                 body = json.loads(self.rfile.read(length)) if length else None
+                time.sleep(extra_delay_s)
                 try:
                     if route is None:
                         raise HttpError(404, "no such route")
@@ -215,7 +219,8 @@ def main() -> None:
 
     service = SERVICES[args.service]
     provider = setup_tracing(args.service, {**COMMON_RESOURCE, **service.resource})
-    server = ThreadingHTTPServer(("127.0.0.1", service.port), make_handler(service))
+    extra_delay_s = float(os.environ.get("SLOW_MS", "0")) / 1000 if os.environ.get("SLOW_SERVICE") == args.service else 0.0
+    server = ThreadingHTTPServer(("127.0.0.1", service.port), make_handler(service, extra_delay_s))
     signal.signal(signal.SIGTERM, _stop)
     print(f"{args.service} listening on http://127.0.0.1:{service.port}", flush=True)
     try:

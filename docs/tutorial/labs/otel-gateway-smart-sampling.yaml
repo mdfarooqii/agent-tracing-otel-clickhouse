@@ -1,0 +1,91 @@
+# Lab: metrics from every span, then tail sampling. Merged on top of
+# otel-gateway-config.yaml by compose.smart-sampling.yaml; maps merge, lists
+# (like processors) replace. Needs the tables in metrics-tables.sql.
+
+connectors:
+  # Calls, errors and a latency histogram per service, span name and kind,
+  # plus the dimensions listed. Sees every span, because its pipeline has no sampling.
+  spanmetrics:
+    histogram:
+      explicit:
+        buckets: [25ms, 50ms, 100ms, 250ms, 500ms, 750ms, 1s, 1500ms, 2s, 3s, 5s, 10s]
+    dimensions:
+      - name: gen_ai.operation.name
+      - name: gen_ai.request.model
+      - name: gen_ai.tool.name
+    exemplars:
+      enabled: true           # a few trace ids per histogram, to jump to an example
+    aggregation_temporality: AGGREGATION_TEMPORALITY_DELTA
+    metrics_flush_interval: 15s
+  # Pairs each client span with the server span it called, and measures the
+  # call per edge: support-agent -> kb-search-api, ticket-api -> postgresql, ...
+  servicegraph:
+    latency_histogram_buckets: [25ms, 50ms, 100ms, 250ms, 500ms, 750ms, 1s, 1500ms, 2s, 3s, 5s]
+    store:
+      ttl: 10s
+      max_items: 10000
+    # A client span with no matching server span (an uninstrumented database
+    # or LLM provider) becomes an edge to a "virtual" node named by these.
+    virtual_node_peer_attributes: [db.system.name, gen_ai.provider.name]
+    metrics_flush_interval: 15s
+
+processors:
+  # Turns the cumulative service-graph counters into per-interval deltas,
+  # so every row in ClickHouse is "what happened in these 15 seconds".
+  cumulativetodelta: {}
+  tail_sampling:
+    decision_wait: 10s
+    num_traces: 20000
+    policies:                 # a trace is kept if ANY policy matches
+      - name: keep-errors
+        type: status_code
+        status_code: { status_codes: [ERROR] }
+      # One "slow" line per agent, at about 1.3x its normal 90th percentile.
+      - name: slow-hr-agent
+        type: and
+        and:
+          and_sub_policy:
+            - { name: is-hr-agent, type: string_attribute, string_attribute: { key: service.name, values: [hr-agent] } }
+            - { name: over-1s, type: latency, latency: { threshold_ms: 1000 } }
+      - name: slow-sales-agent
+        type: and
+        and:
+          and_sub_policy:
+            - { name: is-sales-agent, type: string_attribute, string_attribute: { key: service.name, values: [sales-agent] } }
+            - { name: over-1300ms, type: latency, latency: { threshold_ms: 1300 } }
+      - name: slow-support-agent
+        type: and
+        and:
+          and_sub_policy:
+            - { name: is-support-agent, type: string_attribute, string_attribute: { key: service.name, values: [support-agent] } }
+            - { name: over-2200ms, type: latency, latency: { threshold_ms: 2200 } }
+      - name: slow-anything           # safety net for agents without their own line
+        type: latency
+        latency: { threshold_ms: 5000 }
+      # The ticket-api team opted in to a higher rate: half of every trace that touches it.
+      - name: ticket-api-50-percent
+        type: and
+        and:
+          and_sub_policy:
+            - { name: touches-ticket-api, type: string_attribute, string_attribute: { key: service.name, values: [ticket-api] } }
+            - { name: half, type: probabilistic, probabilistic: { sampling_percentage: 50 } }
+      - name: baseline-5-percent      # normal traces, to compare slow ones against
+        type: probabilistic
+        probabilistic: { sampling_percentage: 5 }
+
+service:
+  pipelines:
+    # Every span, unsampled: feeds the two connectors, stores nothing itself.
+    traces/all:
+      receivers: [otlp]
+      processors: [memory_limiter, filter/require_org_labels, resource/org_platform]
+      exporters: [spanmetrics, servicegraph]
+    # Stored traces: only what tail sampling keeps.
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, filter/require_org_labels, resource/org_platform, tail_sampling, batch]
+      exporters: [clickhouse, debug]
+    metrics:
+      receivers: [spanmetrics, servicegraph]
+      processors: [memory_limiter, cumulativetodelta, batch]
+      exporters: [clickhouse]

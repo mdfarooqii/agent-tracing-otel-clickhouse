@@ -456,8 +456,8 @@ The two rows worth reasoning through:
 - `clickhouse/schema.sql`: all tables and materialized views, created with
   `ON CLUSTER tracing` so they appear on both servers.
 - `compose.yaml`: the `clickhouse-init` service applies the schema, then
-  waits until all four replicated tables are writable on both servers,
-  before the gateway starts.
+  waits until the schema's four replicated tables (plus any a lab added) are
+  writable on both servers, before the gateway starts.
 - `otel-gateway-config.yaml`: the `batch` processor (1000 spans or 5 s) and
   the exporter's `retry_on_failure` (up to 300 s).
 

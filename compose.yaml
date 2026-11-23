@@ -68,14 +68,15 @@ services:
     image: ${REGISTRY:-docker.io}/clickhouse/clickhouse-server:25.8
     container_name: clickhouse-init
     # Replicated tables finish initialising after the server is healthy, so wait
-    # until all four are writable on both replicas before the gateway starts inserting.
+    # until the schema's four (plus any added by labs) are writable on both
+    # replicas before the gateway starts inserting.
     entrypoint: ["bash", "-c"]
     command:
       - |
         set -e
         clickhouse-client --host=clickhouse-01 --password=demo --multiquery --queries-file=/schema.sql
         for host in clickhouse-01 clickhouse-02; do
-          until [ "$$(clickhouse-client --host=$$host --password=demo -q "SELECT countIf(NOT is_readonly) FROM system.replicas WHERE database = 'otel'" 2>/dev/null)" = 4 ]; do
+          until [ "$$(clickhouse-client --host=$$host --password=demo -q "SELECT count() >= 4 AND countIf(is_readonly) = 0 FROM system.replicas WHERE database = 'otel'" 2>/dev/null)" = 1 ]; do
             sleep 1
           done
         done
